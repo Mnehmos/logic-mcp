@@ -3,7 +3,6 @@
   "version": "0.1.0",
   "description": "Logic MCP Server - Rebuilt",
   "main": "build/index.js",
-  "type": "module",
   "scripts": {
     "build": "tsc && node -e \"require('fs').chmodSync('build/index.js', '755')\"",
     "start": "node build/index.js",
@@ -17,9 +16,13 @@
   "license": "MIT",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",
+    "@types/cors": "^2.8.18",
+    "@types/express": "^5.0.2",
     "@types/sqlite3": "^3.1.11",
     "axios": "^1.9.0",
+    "cors": "^2.8.5",
     "dotenv": "^16.5.0",
+    "express": "^5.1.0",
     "sqlite3": "^5.1.7",
     "zod": "^3.25.49"
   },

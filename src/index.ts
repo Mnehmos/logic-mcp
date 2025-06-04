@@ -8,17 +8,27 @@ import path from 'path';
 import crypto from 'crypto'; // For hashing
 import dotenv from 'dotenv';
 import axios from 'axios';
+import express, { Router, Request, Response, NextFunction, RequestHandler } from 'express';
+import cors from 'cors';
 
 // Load environment variables from .env file
 dotenv.config();
 
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions";
+const HTTP_PORT = process.env.HTTP_PORT || '3001'; // Use HTTP_PORT from .env, default to '3001'
+const ENABLE_HTTP_API = process.env.ENABLE_HTTP_API === 'true';
 
 const DB_FILE_NAME = 'logic_mcp.db';
 const DB_PATH = path.join(process.cwd(), DB_FILE_NAME); // Assumes server runs from its root dir
 
 let db: sqlite3.Database;
+
+const app = express();
+
+// Middleware
+app.use(cors()); // Enable CORS for all routes
+app.use(express.json()); // Parse JSON request bodies
 
 async function initializeDatabase() {
   return new Promise<void>((resolve, reject) => {
@@ -75,7 +85,21 @@ CREATE INDEX IF NOT EXISTS idx_operations_primitive ON operations(primitive_name
 CREATE INDEX IF NOT EXISTS idx_operations_status ON operations(status);
 CREATE INDEX IF NOT EXISTS idx_relationships_parent ON operation_relationships(parent_id);
 CREATE INDEX IF NOT EXISTS idx_relationships_child ON operation_relationships(child_id);
-      `;
+
+-- LLM Configurations Table
+CREATE TABLE IF NOT EXISTS llm_configurations (
+  id TEXT PRIMARY KEY, -- UUID for unique identification of each configuration
+  provider TEXT NOT NULL, -- e.g., "OpenRouter", "OpenAI", "Anthropic"
+  model TEXT NOT NULL, -- e.g., "deepseek/deepseek-r1-0528:free", "gpt-4o-mini", "claude-3-opus-20240229"
+  api_key_id TEXT NOT NULL, -- Reference to a secure key management system (e.g., "openrouter_prod_key_id")
+  is_active BOOLEAN NOT NULL DEFAULT FALSE, -- Only one configuration can be active at a time
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Ensure only one configuration can be active at a time
+CREATE UNIQUE INDEX IF NOT EXISTS idx_active_llm_config ON llm_configurations (is_active) WHERE is_active = TRUE;
+    `;
 
       db.exec(schema, (execErr) => {
         if (execErr) {
@@ -191,6 +215,694 @@ const operationSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("retrieve_artifact"), params: retrieveArtifactParamsSchema }),
   z.object({ type: z.literal("retrieve_observation"), params: retrieveObservationParamsSchema }),
 ]).describe("Defines the type of logic operation to perform and its specific parameters.");
+// --- API Routes for LLM Configuration ---
+const llmConfigRouter: Router = express.Router();
+
+const WEB_APP_API_KEY = process.env.MCP_SERVER_API_KEY_FOR_WEBAPP;
+
+// Middleware for API Key Authentication
+const authenticateApiKey: RequestHandler = (req, res, next) => {
+if (!WEB_APP_API_KEY) {
+  // If no key is set in .env, for development, we might allow requests.
+  // In production, this should be a hard failure.
+  console.warn("Warning: MCP_SERVER_API_KEY_FOR_WEBAPP is not set. API is currently unsecured for development.");
+  next();
+  return;
+}
+const authHeader = req.headers.authorization;
+if (!authHeader || !authHeader.startsWith('Bearer ')) {
+  res.status(401).json({ error: "Unauthorized: Missing or malformed Authorization header. Expected 'Bearer <token>'." });
+  return;
+}
+const token = authHeader.split(' ')[1];
+if (token !== WEB_APP_API_KEY) {
+  res.status(401).json({ error: "Unauthorized: Invalid API key." });
+  return;
+}
+next();
+};
+
+llmConfigRouter.use('/', authenticateApiKey); // Apply auth to all llm-config routes, explicitly providing base path
+
+// 1. Create a New LLM Configuration
+const createLlmConfigHandler: RequestHandler = async (req, res, _next) => {
+  const { provider, model, api_key: raw_api_key_from_request } = req.body;
+
+  if (!provider || !model || !raw_api_key_from_request) {
+    res.status(400).json({ error: "Missing required fields: provider, model, and api_key are required." });
+    return;
+  }
+  if (typeof provider !== 'string' || typeof model !== 'string' || typeof raw_api_key_from_request !== 'string') {
+    res.status(400).json({ error: "Invalid data types for provider, model, or api_key." });
+    return;
+  }
+
+  const newConfigId = randomUUID(); // from 'crypto' import
+  const apiKeyId = randomUUID(); // This is the ID we store, not the raw key.
+  const currentTime = new Date().toISOString();
+
+  // IMPORTANT: The raw_api_key_from_request is NOT stored in the database.
+  // The user/admin is responsible for setting an environment variable named after `apiKeyId`
+  // with the value of `raw_api_key_from_request` for the server to use it.
+  // e.g., if apiKeyId is "abc-123", set env var "abc-123"="sk-actualkey"
+
+  try {
+    await new Promise<void>((resolve, reject) => {
+      db.run(
+        `INSERT INTO llm_configurations (id, provider, model, api_key_id, is_active, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [newConfigId, provider, model, apiKeyId, false, currentTime, currentTime],
+        function (this: sqlite3.RunResult, err) {
+          if (err) {
+            console.error("Error inserting LLM configuration:", err);
+            reject(err); // Ensure promise is rejected on error
+            return;
+          }
+          resolve();
+        }
+      );
+    });
+
+    // Fetch the newly created record to return it
+    const newRecord = await new Promise<any>((resolve, reject) => {
+        db.get("SELECT id, provider, model, api_key_id, is_active, created_at, updated_at FROM llm_configurations WHERE id = ?", [newConfigId], (err, row) => {
+            if (err) {
+                reject(err); // Ensure promise is rejected on error
+                return;
+            }
+            resolve(row);
+        });
+    });
+
+    if (!newRecord) {
+        // This should ideally not happen if the insert was successful
+        console.error(`Failed to retrieve LLM configuration after insert for ID: ${newConfigId}`);
+        res.status(500).json({ error: "Failed to retrieve the created LLM configuration." });
+        return;
+    }
+    
+    // Log the action and remind about setting the actual API key in environment
+    console.log(`Created new LLM config: ID=${newConfigId}, Provider=${provider}, Model=${model}, API_Key_ID=${apiKeyId}`);
+    console.warn(`ACTION REQUIRED: To use this configuration, set an environment variable named "${apiKeyId}" with the actual API key value.`);
+
+    res.status(201).json(newRecord);
+  } catch (error: any) {
+    console.error("Error in POST /api/llm-config:", error);
+    res.status(500).json({ error: "Internal Server Error", details: error.message });
+  }
+};
+
+llmConfigRouter.post('/', createLlmConfigHandler);
+
+// 2. Get All LLM Configurations
+const getAllLlmConfigsHandler: RequestHandler = async (_req, res) => {
+  try {
+    const rows = await new Promise<any[]>((resolve, reject) => {
+      db.all("SELECT id, provider, model, api_key_id, is_active, created_at, updated_at FROM llm_configurations ORDER BY created_at DESC", (err, rows) => {
+        if (err) {
+          console.error("Error fetching LLM configurations:", err);
+          reject(err);
+          return;
+        }
+        resolve(rows);
+      });
+    });
+    res.status(200).json(rows);
+  } catch (error: any) {
+    console.error("Error in GET /api/llm-config:", error);
+    res.status(500).json({ error: "Internal Server Error", details: error.message });
+  }
+};
+
+llmConfigRouter.get('/', getAllLlmConfigsHandler);
+
+// 3. Get a Specific LLM Configuration
+const getLlmConfigByIdHandler: RequestHandler = async (req, res) => {
+  const { id } = req.params;
+  try {
+    const row = await new Promise<any>((resolve, reject) => {
+      db.get("SELECT id, provider, model, api_key_id, is_active, created_at, updated_at FROM llm_configurations WHERE id = ?", [id], (err, row) => {
+        if (err) {
+          console.error(`Error fetching LLM configuration with ID ${id}:`, err);
+          reject(err);
+          return;
+        }
+        resolve(row);
+      });
+    });
+
+    if (row) {
+      res.status(200).json(row);
+    } else {
+      res.status(404).json({ error: `LLM Configuration with ID ${id} not found.` });
+    }
+  } catch (error: any) {
+    console.error(`Error in GET /api/llm-config/${id}:`, error);
+    res.status(500).json({ error: "Internal Server Error", details: error.message });
+  }
+};
+
+llmConfigRouter.get('/:id', getLlmConfigByIdHandler);
+
+// 4. Update an Existing LLM Configuration
+const updateLlmConfigHandler: RequestHandler = async (req, res) => {
+  const { id } = req.params;
+  const { provider, model } = req.body; // Only allow updating provider and model here
+
+  if (!provider && !model) {
+    res.status(400).json({ error: "Missing fields to update: provider or model is required." });
+    return;
+  }
+
+  const fieldsToUpdate: { key: string, value: any }[] = [];
+  if (provider) fieldsToUpdate.push({ key: "provider", value: provider });
+  if (model) fieldsToUpdate.push({ key: "model", value: model });
+  
+  fieldsToUpdate.push({ key: "updated_at", value: new Date().toISOString() });
+
+  const setClauses = fieldsToUpdate.map(field => `${field.key} = ?`).join(', ');
+  const values = fieldsToUpdate.map(field => field.value);
+  values.push(id); // For the WHERE clause
+
+  try {
+    const result = await new Promise<{ changes: number }>((resolve, reject) => {
+      db.run(`UPDATE llm_configurations SET ${setClauses} WHERE id = ?`, values, function (this: sqlite3.RunResult, err) {
+        if (err) {
+          console.error(`Error updating LLM configuration with ID ${id}:`, err);
+          reject(err);
+          return;
+        }
+        resolve({ changes: this.changes });
+      });
+    });
+
+    if (result.changes === 0) {
+      res.status(404).json({ error: `LLM Configuration with ID ${id} not found.` });
+      return;
+    }
+
+    // Fetch and return the updated record
+    const updatedRecord = await new Promise<any>((resolve, reject) => {
+      db.get("SELECT id, provider, model, api_key_id, is_active, created_at, updated_at FROM llm_configurations WHERE id = ?", [id], (err, row) => {
+        if (err) reject(err);
+        else resolve(row);
+      });
+    });
+    res.status(200).json(updatedRecord);
+
+  } catch (error: any) {
+    console.error(`Error in PUT /api/llm-config/${id}:`, error);
+    res.status(500).json({ error: "Internal Server Error", details: error.message });
+  }
+};
+
+llmConfigRouter.put('/:id', updateLlmConfigHandler);
+
+// 5. Activate an LLM Configuration
+const activateLlmConfigHandler: RequestHandler = async (req, res) => {
+  const { id } = req.params;
+  const currentTime = new Date().toISOString();
+
+  try {
+    await new Promise<void>((resolve, reject) => {
+      db.serialize(() => {
+        db.run("BEGIN TRANSACTION;", (errBegin) => {
+          if (errBegin) return reject(errBegin);
+
+          // Deactivate all other configurations
+          db.run("UPDATE llm_configurations SET is_active = FALSE, updated_at = ? WHERE is_active = TRUE", [currentTime], (errUpdateAll) => {
+            if (errUpdateAll) {
+              db.run("ROLLBACK;", () => reject(errUpdateAll));
+              return;
+            }
+
+            // Activate the specified configuration
+            db.run("UPDATE llm_configurations SET is_active = TRUE, updated_at = ? WHERE id = ?", [currentTime, id], function (this: sqlite3.RunResult, errUpdateOne) {
+              if (errUpdateOne) {
+                db.run("ROLLBACK;", () => reject(errUpdateOne));
+                return;
+              }
+              if (this.changes === 0) {
+                db.run("ROLLBACK;", () => reject(new Error(`LLM Configuration with ID ${id} not found for activation.`)));
+                return;
+              }
+              db.run("COMMIT;", (errCommit) => {
+                if (errCommit) return reject(errCommit);
+                resolve();
+              });
+            });
+          });
+        });
+      });
+    });
+
+    // Fetch and return the newly activated record
+    const activatedRecord = await new Promise<any>((resolve, reject) => {
+      db.get("SELECT id, provider, model, api_key_id, is_active, created_at, updated_at FROM llm_configurations WHERE id = ?", [id], (err, row) => {
+        if (err) reject(err);
+        else resolve(row);
+      });
+    });
+    
+    if (!activatedRecord) {
+        // This case should be caught by the 'changes === 0' check in the transaction
+        res.status(404).json({ error: `LLM Configuration with ID ${id} not found.` });
+        return;
+    }
+
+    // TODO: Implement hot-reloading mechanism for logic-mcp server here or via webhook
+    console.log(`Activated LLM config: ID=${id}. Hot-reload to be implemented.`);
+
+    res.status(200).json(activatedRecord);
+
+  } catch (error: any) {
+    console.error(`Error in PATCH /api/llm-config/${id}/activate:`, error);
+    if (error.message && error.message.includes("not found for activation")) {
+        res.status(404).json({ error: error.message });
+    } else {
+        res.status(500).json({ error: "Internal Server Error", details: error.message });
+    }
+  }
+};
+
+llmConfigRouter.patch('/:id/activate', activateLlmConfigHandler);
+
+// 6. Delete an LLM Configuration
+const deleteLlmConfigHandler: RequestHandler = async (req, res) => {
+  const { id } = req.params;
+  try {
+    const result = await new Promise<{ changes: number }>((resolve, reject) => {
+      db.run("DELETE FROM llm_configurations WHERE id = ?", [id], function (this: sqlite3.RunResult, err) {
+        if (err) {
+          console.error(`Error deleting LLM configuration with ID ${id}:`, err);
+          reject(err);
+          return;
+        }
+        resolve({ changes: this.changes });
+      });
+    });
+
+    if (result.changes === 0) {
+      res.status(404).json({ error: `LLM Configuration with ID ${id} not found.` });
+      return;
+    }
+    // TODO: If the deleted config was active, logic-mcp should revert to a default or no LLM.
+    // This might involve a hot-reload trigger or a check on next LLM use.
+    console.log(`Deleted LLM config: ID=${id}. Active config status needs re-evaluation by server.`);
+    res.status(204).send(); // No Content
+
+  } catch (error: any) {
+    console.error(`Error in DELETE /api/llm-config/${id}:`, error);
+    res.status(500).json({ error: "Internal Server Error", details: error.message });
+  }
+};
+
+llmConfigRouter.delete('/:id', deleteLlmConfigHandler);
+
+// 7. Webhook for Hot-Reloading (Internal)
+const reloadLlmConfigHandler: RequestHandler = async (_req, res) => {
+  // TODO: Implement the actual hot-reloading logic within the MCP server.
+  // This would involve:
+  // 1. Re-querying the active configuration from `llm_configurations`.
+  // 2. Re-retrieving the API key from the environment (based on the new api_key_id).
+  // 3. Re-initializing or updating the LLM client instance (e.g., the axios setup for OpenRouter).
+  console.log("Received request to /api/llm-config/reload. Hot-reload mechanism to be implemented.");
+  res.status(200).json({ status: "success", message: "LLM configuration reload initiated (stub)." });
+};
+
+llmConfigRouter.post('/reload', reloadLlmConfigHandler);
+
+app.use('/api/llm-config', llmConfigRouter);
+
+// --- API Routes for Logic Explorer ---
+const logicExplorerRouter: Router = express.Router();
+logicExplorerRouter.use(authenticateApiKey); // Reuse the same authentication
+
+// 1. List All Logic Chains
+interface LogicChainSummaryRow {
+  chain_id: string;
+  description: string | null;
+  root_operation_uuid: string | null;
+  created_at: string;
+  operation_count: number;
+}
+
+const listAllLogicChainsHandler: RequestHandler = async (_req, res) => {
+  try {
+    const chains = await new Promise<LogicChainSummaryRow[]>((resolve, reject) => {
+      // Query to get chain details and count of operations in each chain
+      const sql = `
+        SELECT
+          lc.chain_id,
+          lc.description,
+          op_root.operation_id as root_operation_uuid,
+          lc.created_at,
+          (SELECT COUNT(*) FROM operations ops WHERE json_extract(ops.context, '$.chain_id') = lc.chain_id) as operation_count
+        FROM logic_chains lc
+        LEFT JOIN operations op_root ON lc.root_operation = op_root.id
+        ORDER BY lc.created_at DESC
+      `;
+      db.all(sql, (err, rows: LogicChainSummaryRow[]) => {
+        if (err) {
+          console.error("Error fetching logic chains:", err);
+          return reject(err);
+        }
+        // Map to ensure the output field name matches the design doc if different from query alias
+        resolve(rows.map(row => ({
+            chain_id: row.chain_id,
+            description: row.description,
+            root_operation_uuid: row.root_operation_uuid || null, // Corrected to match interface
+            created_at: row.created_at,
+            operation_count: row.operation_count
+        })));
+      });
+    });
+    res.status(200).json(chains);
+  } catch (error: any) {
+    console.error("Error in GET /api/logic-explorer/chains:", error);
+    res.status(500).json({ error: "Internal Server Error", details: error.message });
+  }
+};
+logicExplorerRouter.get('/chains', listAllLogicChainsHandler);
+
+// Helper function to parse JSON safely
+const safeJsonParse = (jsonString: string | null, defaultValue: any = null) => {
+  if (!jsonString) return defaultValue;
+  try {
+    return JSON.parse(jsonString);
+  } catch (e) {
+    console.warn("Failed to parse JSON string:", jsonString, e);
+    return defaultValue; // Or return the original string if preferred
+  }
+};
+
+// 2. Get a Specific Logic Chain with its Operations
+interface OperationDetail {
+    operation_id: string;
+    primitive_name: string;
+    input_data: any;
+    output_data: any;
+    status: string;
+    start_time: string;
+    end_time: string | null;
+    context: any;
+    parent_operation_uuids: string[];
+    child_operation_uuids: string[];
+    // For internal use during construction
+    db_id?: number;
+}
+
+const getChainWithOperationsHandler: RequestHandler = async (req, res) => {
+  const { chainId } = req.params;
+  try {
+    // 1. Fetch chain details
+    const chainDetails = await new Promise<any>((resolve, reject) => {
+      db.get(`
+        SELECT lc.chain_id, lc.description, op_root.operation_id as root_operation_uuid, lc.created_at
+        FROM logic_chains lc
+        LEFT JOIN operations op_root ON lc.root_operation = op_root.id
+        WHERE lc.chain_id = ?
+      `, [chainId], (err, row) => {
+        if (err) return reject(err);
+        resolve(row);
+      });
+    });
+
+    if (!chainDetails) {
+      res.status(404).json({ error: `Logic Chain with ID ${chainId} not found.` });
+      return;
+    }
+
+    // 2. Fetch all operations for this chain
+    const operationsRaw = await new Promise<any[]>((resolve, reject) => {
+      db.all(`
+        SELECT id as db_id, operation_id, primitive_name, input_data, output_data, status, start_time, end_time, context
+        FROM operations
+        WHERE json_extract(context, '$.chain_id') = ?
+        ORDER BY start_time ASC
+      `, [chainId], (err, rows) => {
+        if (err) return reject(err);
+        resolve(rows);
+      });
+    });
+
+    const operationsMap = new Map<string, OperationDetail>();
+    const dbIdToUuidMap = new Map<number, string>();
+
+    const processedOperations: OperationDetail[] = operationsRaw.map(op => {
+      const detail: OperationDetail = {
+        db_id: op.db_id,
+        operation_id: op.operation_id,
+        primitive_name: op.primitive_name,
+        input_data: safeJsonParse(op.input_data, {}),
+        output_data: safeJsonParse(op.output_data, {}),
+        status: op.status,
+        start_time: op.start_time,
+        end_time: op.end_time,
+        context: safeJsonParse(op.context, {}),
+        parent_operation_uuids: [],
+        child_operation_uuids: []
+      };
+      operationsMap.set(op.operation_id, detail);
+      dbIdToUuidMap.set(op.db_id, op.operation_id);
+      return detail;
+    });
+    
+    // 3. Fetch all relationships for the operations in this chain
+    const operationDbIds = operationsRaw.map(op => op.db_id);
+    if (operationDbIds.length > 0) {
+        const placeholders = operationDbIds.map(() => '?').join(',');
+        const relationships = await new Promise<any[]>((resolve, reject) => {
+            db.all(`
+                SELECT parent_id, child_id
+                FROM operation_relationships
+                WHERE parent_id IN (${placeholders}) OR child_id IN (${placeholders})
+            `, [...operationDbIds, ...operationDbIds], (err, relRows) => { // Pass IDs twice for OR condition
+                if (err) return reject(err);
+                resolve(relRows);
+            });
+        });
+
+        relationships.forEach(rel => {
+            const parentUuid = dbIdToUuidMap.get(rel.parent_id);
+            const childUuid = dbIdToUuidMap.get(rel.child_id);
+
+            if (parentUuid && childUuid) {
+                const parentOp = operationsMap.get(parentUuid);
+                const childOp = operationsMap.get(childUuid);
+
+                if (parentOp && !parentOp.child_operation_uuids.includes(childUuid)) {
+                    parentOp.child_operation_uuids.push(childUuid);
+                }
+                if (childOp && !childOp.parent_operation_uuids.includes(parentUuid)) {
+                    childOp.parent_operation_uuids.push(parentUuid);
+                }
+            }
+        });
+    }
+    
+    // Remove db_id before sending response
+    const finalOperations = processedOperations.map(({ db_id, ...rest}) => rest);
+
+    res.status(200).json({
+      chain_id: chainDetails.chain_id,
+      description: chainDetails.description,
+      root_operation_id: chainDetails.root_operation_uuid || null,
+      created_at: chainDetails.created_at,
+      operations: finalOperations
+    });
+    // Implicit return here, making the promise resolve to void
+
+  } catch (error: any) {
+    console.error(`Error in GET /api/logic-explorer/chains/${chainId}:`, error);
+    res.status(500).json({ error: "Internal Server Error", details: error.message });
+    // Implicit return here
+  }
+};
+logicExplorerRouter.get('/chains/:chainId', getChainWithOperationsHandler);
+
+// 3. Get Details for a Specific Operation
+const getOperationDetailsHandler: RequestHandler = async (req, res) => {
+  const { operationId } = req.params;
+  try {
+    // 1. Fetch operation details
+    const operationRaw = await new Promise<any>((resolve, reject) => {
+      db.get(`
+        SELECT id as db_id, operation_id, primitive_name, input_data, output_data, status, start_time, end_time, context
+        FROM operations
+        WHERE operation_id = ?
+      `, [operationId], (err, row) => {
+        if (err) return reject(err);
+        resolve(row);
+      });
+    });
+
+    if (!operationRaw) {
+      res.status(404).json({ error: `Operation with ID ${operationId} not found.` });
+      return;
+    }
+
+    const operationDetail: OperationDetail = {
+      db_id: operationRaw.db_id,
+      operation_id: operationRaw.operation_id,
+      primitive_name: operationRaw.primitive_name,
+      input_data: safeJsonParse(operationRaw.input_data, {}),
+      output_data: safeJsonParse(operationRaw.output_data, {}),
+      status: operationRaw.status,
+      start_time: operationRaw.start_time,
+      end_time: operationRaw.end_time,
+      context: safeJsonParse(operationRaw.context, {}),
+      parent_operation_uuids: [],
+      child_operation_uuids: []
+    };
+
+    // 2. Fetch relationships
+    const relationships = await new Promise<any[]>((resolve, reject) => {
+      db.all(`
+        SELECT parent_id, child_id
+        FROM operation_relationships
+        WHERE parent_id = ? OR child_id = ?
+      `, [operationRaw.db_id, operationRaw.db_id], (err, relRows) => {
+        if (err) return reject(err);
+        resolve(relRows);
+      });
+    });
+
+    const parentDbIds = new Set<number>();
+    const childDbIds = new Set<number>();
+
+    relationships.forEach(rel => {
+      if (rel.child_id === operationRaw.db_id) {
+        parentDbIds.add(rel.parent_id);
+      }
+      if (rel.parent_id === operationRaw.db_id) {
+        childDbIds.add(rel.child_id);
+      }
+    });
+
+    // Fetch UUIDs for parent and child db_ids
+    if (parentDbIds.size > 0) {
+      const parentPlaceholders = Array.from(parentDbIds).map(() => '?').join(',');
+      const parentOps = await new Promise<any[]>((resolve, reject) => {
+        db.all(`SELECT operation_id FROM operations WHERE id IN (${parentPlaceholders})`, Array.from(parentDbIds), (err, rows) => {
+          if (err) return reject(err);
+          resolve(rows);
+        });
+      });
+      operationDetail.parent_operation_uuids = parentOps.map(op => op.operation_id);
+    }
+
+    if (childDbIds.size > 0) {
+      const childPlaceholders = Array.from(childDbIds).map(() => '?').join(',');
+      const childOps = await new Promise<any[]>((resolve, reject) => {
+        db.all(`SELECT operation_id FROM operations WHERE id IN (${childPlaceholders})`, Array.from(childDbIds), (err, rows) => {
+          if (err) return reject(err);
+          resolve(rows);
+        });
+      });
+      operationDetail.child_operation_uuids = childOps.map(op => op.operation_id);
+    }
+    
+    // Remove db_id before sending response
+    const { db_id, ...finalOperationDetail } = operationDetail;
+
+    res.status(200).json(finalOperationDetail);
+
+  } catch (error: any) {
+    console.error(`Error in GET /api/logic-explorer/operations/${operationId}:`, error);
+    res.status(500).json({ error: "Internal Server Error", details: error.message });
+  }
+};
+logicExplorerRouter.get('/operations/:operationId', getOperationDetailsHandler);
+
+// 4. Get Operation Relationships (Parents/Children)
+interface OperationRelationshipSummary {
+    operation_id: string;
+    primitive_name: string;
+}
+const getOperationRelationshipsHandler: RequestHandler = async (req, res) => {
+    const { operationId } = req.params;
+    try {
+        // 1. Get the db_id for the given operation_id
+        const currentOpDbRow = await new Promise<{ id: number } | undefined>((resolve, reject) => {
+            db.get("SELECT id FROM operations WHERE operation_id = ?", [operationId], (err, row: any) => {
+                if (err) {
+                    reject(err);
+                    return;
+                }
+                resolve(row);
+            });
+        });
+
+        if (!currentOpDbRow) {
+            res.status(404).json({ error: `Operation with ID ${operationId} not found.` });
+            return;
+        }
+        const currentOpDbId = currentOpDbRow.id;
+
+        // 2. Fetch parent relationships (operations that are parents to currentOpDbId)
+        const parentRels = await new Promise<OperationRelationshipSummary[]>((resolve, reject) => {
+            db.all(`
+                SELECT o.operation_id, o.primitive_name
+                FROM operation_relationships rel
+                JOIN operations o ON rel.parent_id = o.id
+                WHERE rel.child_id = ?
+            `, [currentOpDbId], (err, rows: any[]) => { // Explicitly type rows as any[] for now
+                if (err) {
+                    reject(err);
+                    return;
+                }
+                resolve(rows as OperationRelationshipSummary[]);
+            });
+        });
+        
+        // 3. Fetch child relationships (operations that are children of currentOpDbId)
+        const childRels = await new Promise<OperationRelationshipSummary[]>((resolve, reject) => {
+            db.all(`
+                SELECT o.operation_id, o.primitive_name
+                FROM operation_relationships rel
+                JOIN operations o ON rel.child_id = o.id
+                WHERE rel.parent_id = ?
+            `, [currentOpDbId], (err, rows: any[]) => { // Explicitly type rows as any[] for now
+                if (err) {
+                    reject(err);
+                    return;
+                }
+                resolve(rows as OperationRelationshipSummary[]);
+            });
+        });
+
+        res.status(200).json({
+            operation_id: operationId,
+            parents: parentRels,
+            children: childRels
+        });
+
+    } catch (error: any) {
+        console.error(`Error in GET /api/logic-explorer/operations/${operationId}/relationships:`, error);
+        res.status(500).json({ error: "Internal Server Error", details: error.message });
+    }
+};
+logicExplorerRouter.get('/operations/:operationId/relationships', getOperationRelationshipsHandler);
+
+app.use('/api/logic-explorer', logicExplorerRouter);
+
+// Helper function to start HTTP server and return a promise
+function startHttpServer(appInstance: express.Application, port: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const serverInstance = appInstance.listen(port, () => {
+      console.log(`HTTP API server listening on port ${port}`);
+      resolve(); // Resolve when server is listening
+    });
+    serverInstance.on('error', (err: any) => {
+      console.error(`HTTP API server failed to start on port ${port}:`, err);
+      if (err.code === 'EADDRINUSE') {
+        console.error(`Port ${port} is already in use. Please use a different port or stop the other application using it.`);
+      }
+      reject(err); // Reject the promise if server fails to start
+    });
+  });
+}
 
 // --- Tool Input Schema ---
 const executeLogicOperationInputSchema = z.object({
@@ -1136,6 +1848,20 @@ Please generate a well-formulated query, a series of questions, or a detailed pl
 async function main() {
   try {
     await initializeDatabase();
+
+    if (ENABLE_HTTP_API) {
+      const port = parseInt(HTTP_PORT, 10);
+      if (isNaN(port) || port < 1 || port > 65535) {
+        throw new Error(`Invalid HTTP_PORT: '${HTTP_PORT}'. Must be a number between 1-65535`);
+      }
+
+      console.log(`Attempting to start HTTP API server on port ${port}...`);
+      await startHttpServer(app, port);
+    } else {
+      console.log("HTTP API is disabled. Set ENABLE_HTTP_API=true in .env to enable it.");
+    }
+
+    // Start MCP server
     const transport = new StdioServerTransport();
     await server.connect(transport);
     console.log(`Logic MCP server "logic-mcp" running on stdio, using database at ${DB_PATH}`);
