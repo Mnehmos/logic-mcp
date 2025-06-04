@@ -1177,6 +1177,78 @@ server.tool(
       }
       // The outer try/catch in execute_logic_operation will handle errors thrown from here.
     };
+
+    // New Centralized LLM Call Helper
+    interface LlmCallParams {
+      activeConfig: { provider: string; model: string };
+      actualApiKey: string;
+      userPrompt: string;
+      systemPrompt?: string; // Optional, as Gemini direct call is simpler
+    }
+    interface LlmCallResponse {
+      content: string;
+      modelUsed: string;
+      apiResponseId?: string;
+      rawResponse?: any; // For debugging or more complex parsing if needed
+    }
+
+    const callConfiguredLlm = async ({ activeConfig, actualApiKey, userPrompt, systemPrompt }: LlmCallParams): Promise<LlmCallResponse> => {
+      let llmApiResponse: any;
+      if (activeConfig.provider === "gemini") {
+        const geminiApiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${activeConfig.model}:generateContent?key=${actualApiKey}`;
+        // Gemini's simple API doesn't have a direct system prompt field in the same way as OpenAI.
+        // System instructions are often prepended to the user prompt or handled via multi-turn context.
+        // For a single call, we'll combine system and user prompt if systemPrompt is provided.
+        const effectivePrompt = systemPrompt ? `${systemPrompt}\n\nUser: ${userPrompt}` : userPrompt;
+        const geminiPayload = {
+          contents: [{ parts: [{ text: effectivePrompt }] }],
+        };
+        console.log(`Calling Gemini: URL=${geminiApiUrl.split('key=')[0]}... Payload=${JSON.stringify(geminiPayload)}`);
+        llmApiResponse = await axios.post(geminiApiUrl, geminiPayload, {
+          headers: { "Content-Type": "application/json" },
+        });
+
+        if (llmApiResponse.data && llmApiResponse.data.candidates && llmApiResponse.data.candidates.length > 0 &&
+            llmApiResponse.data.candidates[0].content && llmApiResponse.data.candidates[0].content.parts &&
+            llmApiResponse.data.candidates[0].content.parts.length > 0) {
+          return {
+            content: llmApiResponse.data.candidates[0].content.parts[0].text,
+            modelUsed: `gemini/${activeConfig.model}`,
+            rawResponse: llmApiResponse.data
+            // apiResponseId is not standard in Gemini's simple generateContent response this way
+          };
+        } else {
+          console.error("Gemini API call failed or returned unexpected format:", llmApiResponse.data);
+          throw new Error("LLM call (Gemini) failed: No response or unexpected format.");
+        }
+      } else { // Default to OpenRouter or other OpenAI-compatible providers
+        const messages = [];
+        if (systemPrompt) {
+          messages.push({ role: "system", content: systemPrompt });
+        }
+        messages.push({ role: "user", content: userPrompt });
+        
+        console.log(`Calling ${activeConfig.provider} via OpenRouter: URL=${OPENROUTER_API_URL}, Model=${activeConfig.model}`);
+        llmApiResponse = await axios.post(
+          OPENROUTER_API_URL,
+          { model: activeConfig.model, messages: messages },
+          { headers: { "Authorization": `Bearer ${actualApiKey}`, "Content-Type": "application/json" } }
+        );
+
+        if (llmApiResponse.data && llmApiResponse.data.choices && llmApiResponse.data.choices.length > 0) {
+          return {
+            content: llmApiResponse.data.choices[0].message.content,
+            modelUsed: llmApiResponse.data.model,
+            apiResponseId: llmApiResponse.data.id,
+            rawResponse: llmApiResponse.data
+          };
+        } else {
+          console.error("OpenRouter API call failed or returned unexpected format:", llmApiResponse.data);
+          throw new Error("LLM call (OpenRouter compatible) failed: No response or unexpected format.");
+        }
+      }
+    };
+
     let operationOutput: any = { message: "Operation processed (stub)." };
     let operationStatus: "success" | "failure" = "success";
     let errorMessage: string | undefined;
@@ -1266,76 +1338,19 @@ server.tool(
             // Build the prompt
             const conceptName = params.operation.params.concept_name;
             const descriptionPart = params.operation.params.description ? `Description: ${params.operation.params.description}\n` : '';
-            const fullPrompt = `Define the concept: '${conceptName}'\n\n${descriptionPart}${contextData}Please provide a comprehensive definition:`;
+            const userPromptForDefine = `Define the concept: '${conceptName}'\n\n${descriptionPart}${contextData}Please provide a comprehensive definition:`;
+            const systemPromptForDefine = "You are a helpful assistant that provides clear, concise definitions of concepts.";
+
+            const llmResult = await callConfiguredLlm({ activeConfig, actualApiKey, userPrompt: userPromptForDefine, systemPrompt: systemPromptForDefine });
             
-            let llmApiResponse: any;
-
-            if (activeConfig.provider === "gemini") {
-              const geminiApiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${activeConfig.model}:generateContent?key=${actualApiKey}`;
-              const geminiPayload = {
-                contents: [{
-                  parts: [{ text: fullPrompt }]
-                }]
-                // TODO: Add system instruction if Gemini API supports it directly in this structure,
-                // or prepend it to the user's fullPrompt if necessary.
-                // For now, system instruction "You are a helpful assistant..." is omitted for direct Gemini.
-              };
-              console.log(`Define with Gemini: URL=${geminiApiUrl}, Payload=${JSON.stringify(geminiPayload)}`);
-              llmApiResponse = await axios.post(geminiApiUrl, geminiPayload, {
-                headers: { "Content-Type": "application/json" },
-              });
-
-              if (llmApiResponse.data && llmApiResponse.data.candidates && llmApiResponse.data.candidates.length > 0 &&
-                  llmApiResponse.data.candidates[0].content && llmApiResponse.data.candidates[0].content.parts &&
-                  llmApiResponse.data.candidates[0].content.parts.length > 0) {
-                operationOutput = {
-                  definition_id: operationIdUUID,
-                  concept_defined: conceptName,
-                  generated_definition: llmApiResponse.data.candidates[0].content.parts[0].text,
-                  based_on_observations: params.operation.params.based_on_observation_ids || [],
-                  model_used: `gemini/${activeConfig.model}`, // Indicate Gemini was used
-                  api_response_id: "N/A for direct Gemini in this format" // Gemini API response structure is different
-                };
-              } else {
-                operationStatus = "failure";
-                errorMessage = "Define operation with Gemini failed: No response or unexpected format.";
-                operationOutput = { message: errorMessage, details: llmApiResponse.data };
-              }
-
-            } else { // Default to OpenRouter or other compatible providers
-              console.log(`Define with ${activeConfig.provider}: URL=${OPENROUTER_API_URL}, Model=${activeConfig.model}`);
-              llmApiResponse = await axios.post(
-                OPENROUTER_API_URL,
-                {
-                  model: activeConfig.model,
-                  messages: [
-                    { role: "system", content: "You are a helpful assistant that provides clear, concise definitions of concepts." },
-                    { role: "user", content: fullPrompt }
-                  ],
-                },
-                {
-                  headers: {
-                    "Authorization": `Bearer ${actualApiKey}`,
-                    "Content-Type": "application/json",
-                  },
-                }
-              );
-
-              if (llmApiResponse.data && llmApiResponse.data.choices && llmApiResponse.data.choices.length > 0) {
-                operationOutput = {
-                  definition_id: operationIdUUID,
-                  concept_defined: conceptName,
-                  generated_definition: llmApiResponse.data.choices[0].message.content,
-                  based_on_observations: params.operation.params.based_on_observation_ids || [],
-                  model_used: llmApiResponse.data.model, // Model from OpenRouter response
-                  api_response_id: llmApiResponse.data.id
-                };
-              } else {
-                operationStatus = "failure";
-                errorMessage = "Define operation failed: No response from LLM or unexpected format.";
-                operationOutput = { message: errorMessage, details: llmApiResponse.data };
-              }
-            }
+            operationOutput = {
+              definition_id: operationIdUUID,
+              concept_defined: conceptName,
+              generated_definition: llmResult.content,
+              based_on_observations: params.operation.params.based_on_observation_ids || [],
+              model_used: llmResult.modelUsed,
+              api_response_id: llmResult.apiResponseId || (llmResult.rawResponse as any)?.id || "N/A"
+            };
           } catch (apiError: any) {
             operationStatus = "failure";
             if (axios.isAxiosError(apiError)) {
@@ -1358,42 +1373,19 @@ server.tool(
                 premiseContext = `Based on previous operations (IDs: ${params.operation.params.premise_operation_ids.join(', ')}), `;
             }
 
-            const userPrompt = params.operation.params.prompt_or_query || "Perform a general inference.";
-            const fullPrompt = premiseContext + userPrompt;
+            const userPromptForInfer = params.operation.params.prompt_or_query || "Perform a general inference.";
+            const fullPromptForInfer = premiseContext + userPromptForInfer;
+            const systemPromptForInfer = "You are a helpful assistant performing a logical inference.";
 
-            const response = await axios.post(
-              OPENROUTER_API_URL, // This might need to be dynamic if not using OpenRouter based on activeConfig.provider
-              {
-                model: activeConfig.model, // Use model from active config
-                messages: [
-                  { role: "system", content: "You are a helpful assistant performing a logical inference." },
-                  { role: "user", content: fullPrompt }
-                ],
-              },
-              {
-                headers: {
-                  "Authorization": `Bearer ${actualApiKey}`, // Use actualApiKey from active config
-                  "Content-Type": "application/json",
-                  // Recommended by OpenRouter:
-                  // "HTTP-Referer": `${YOUR_SITE_URL}`, // Consider making these dynamic or configurable if needed
-                  // "X-Title": `${YOUR_SITE_NAME}`,      // Consider making these dynamic or configurable if needed
-                },
-              }
-            );
+            const llmResultInfer = await callConfiguredLlm({ activeConfig, actualApiKey, userPrompt: fullPromptForInfer, systemPrompt: systemPromptForInfer });
 
-            if (response.data && response.data.choices && response.data.choices.length > 0) {
-              operationOutput = {
-                inference_id: operationIdUUID,
-                conclusion: response.data.choices[0].message.content,
-                premises_used: params.operation.params.premise_operation_ids,
-                model_used: response.data.model,
-                api_response_id: response.data.id
-              };
-            } else {
-              operationStatus = "failure";
-              errorMessage = "Infer operation failed: No response from LLM or unexpected format.";
-              operationOutput = { message: errorMessage, details: response.data };
-            }
+            operationOutput = {
+              inference_id: operationIdUUID,
+              conclusion: llmResultInfer.content,
+              premises_used: params.operation.params.premise_operation_ids,
+              model_used: llmResultInfer.modelUsed,
+              api_response_id: llmResultInfer.apiResponseId || (llmResultInfer.rawResponse as any)?.id || "N/A"
+            };
           } catch (apiError: any) {
             operationStatus = "failure";
             if (axios.isAxiosError(apiError)) {
@@ -1486,38 +1478,21 @@ server.tool(
             
             const fullPrompt = `${optionsContext}\n${criteriaContext}\nDecision Prompt: ${decisionPrompt}\nDecision Method: ${decisionMethod}\n\nThe chosen option is ID: ${chosenOptionIdForJustification}. Please provide a detailed justification for why this option was chosen (or would be chosen) based on the provided criteria and decision method, explaining its strengths relative to other options (even if other options are not fully detailed here, infer their general nature if possible from the decision prompt).`;
 
-            const llmResponse = await axios.post(
-              OPENROUTER_API_URL, // Assuming OpenRouter URL for now, or make dynamic based on activeConfig.provider
-              {
-                model: activeConfig.model,
-                messages: [
-                  { role: "system", content: "You are a helpful assistant that provides justifications for decisions based on options and criteria." },
-                  { role: "user", content: fullPrompt }
-                ],
-              },
-              {
-                headers: {
-                  "Authorization": `Bearer ${actualApiKey}`,
-                  "Content-Type": "application/json",
-                },
-              }
-            );
-
-            let justificationText = "LLM Justification failed or not provided.";
-            if (llmResponse.data && llmResponse.data.choices && llmResponse.data.choices.length > 0) {
-              justificationText = llmResponse.data.choices[0].message.content;
-            }
+            const systemPromptForDecide = "You are a helpful assistant that provides justifications for decisions based on options and criteria.";
+            
+            const llmResultDecide = await callConfiguredLlm({ activeConfig, actualApiKey, userPrompt: fullPrompt, systemPrompt: systemPromptForDecide });
 
             operationOutput = {
               decision_id: operationIdUUID,
               chosen_option_id_internal: chosenOptionIdForJustification || "none (error retrieving)",
               chosen_option_output: chosenOptionFullContent,
-              justification: justificationText,
+              justification: llmResultDecide.content,
               options_considered_ids: decideSpecificParams.option_operation_ids,
               criteria_used_id: decideSpecificParams.criteria_operation_id,
-              model_used: llmResponse.data?.model,
-              api_response_id: llmResponse.data?.id
+              model_used: llmResultDecide.modelUsed,
+              api_response_id: llmResultDecide.apiResponseId || (llmResultDecide.rawResponse as any)?.id || "N/A"
             };
+            // Note: The 'else' case for failure is handled by callConfiguredLlm throwing an error.
 
           } catch (apiError: any) {
             operationStatus = "failure";
@@ -1560,38 +1535,20 @@ server.tool(
 
             const synthesisGoal = params.operation.params.synthesis_goal;
             const fullPrompt = `${synthesisContext}\nSynthesis Goal: ${synthesisGoal}\nPlease provide the synthesized output. Adhere to the output format if specified: ${params.operation.params.output_format || 'natural language'}.`;
+            const systemPromptForSynthesize = "You are a helpful assistant performing a synthesis task. Combine the provided inputs to achieve the stated goal.";
             
-            const response = await axios.post(
-              OPENROUTER_API_URL, // Assuming OpenRouter URL for now, or make dynamic based on activeConfig.provider
-              {
-                model: activeConfig.model,
-                messages: [
-                  { role: "system", content: "You are a helpful assistant performing a synthesis task. Combine the provided inputs to achieve the stated goal." },
-                  { role: "user", content: fullPrompt }
-                ],
-              },
-              {
-                headers: {
-                  "Authorization": `Bearer ${actualApiKey}`,
-                  "Content-Type": "application/json",
-                },
-              }
-            );
+            const llmResultSynthesize = await callConfiguredLlm({ activeConfig, actualApiKey, userPrompt: fullPrompt, systemPrompt: systemPromptForSynthesize });
 
-            if (response.data && response.data.choices && response.data.choices.length > 0) {
-              operationOutput = {
-                synthesis_id: operationIdUUID,
-                synthesized_result: response.data.choices[0].message.content,
-                inputs_used: params.operation.params.input_operation_ids,
-                goal_achieved: synthesisGoal,
-                model_used: response.data.model,
-                api_response_id: response.data.id
-              };
-            } else {
-              operationStatus = "failure";
-              errorMessage = "Synthesize operation failed: No response from LLM or unexpected format.";
-              operationOutput = { message: errorMessage, details: response.data };
-            }
+            operationOutput = {
+              synthesis_id: operationIdUUID,
+              synthesized_result: llmResultSynthesize.content,
+              inputs_used: params.operation.params.input_operation_ids,
+              goal_achieved: synthesisGoal,
+              model_used: llmResultSynthesize.modelUsed,
+              api_response_id: llmResultSynthesize.apiResponseId || (llmResultSynthesize.rawResponse as any)?.id || "N/A"
+            };
+            // Note: The 'else' case for failure is handled by callConfiguredLlm throwing an error,
+            // which will be caught by the outer try/catch block for the 'synthesize' case.
           } catch (apiError: any) {
             operationStatus = "failure";
             if (axios.isAxiosError(apiError)) {
@@ -1652,39 +1609,20 @@ server.tool(
             const criteria = params.operation.params.criteria;
             const goal = params.operation.params.goal || "Provide a comprehensive comparison.";
             const fullPrompt = `${comparisonContext}Comparison Criteria: ${criteria}\nComparison Goal: ${goal}\n\nPlease provide the comparison result:`;
+            const systemPromptForCompare = "You are a helpful assistant that compares items based on given criteria and a goal.";
 
-            const response = await axios.post(
-              OPENROUTER_API_URL, // Assuming OpenRouter URL for now, or make dynamic based on activeConfig.provider
-              {
-                model: activeConfig.model,
-                messages: [
-                  { role: "system", content: "You are a helpful assistant that compares items based on given criteria and a goal." },
-                  { role: "user", content: fullPrompt }
-                ],
-              },
-              {
-                headers: {
-                  "Authorization": `Bearer ${actualApiKey}`,
-                  "Content-Type": "application/json",
-                },
-              }
-            );
-
-            if (response.data && response.data.choices && response.data.choices.length > 0) {
-              operationOutput = {
-                comparison_id: operationIdUUID,
-                result: response.data.choices[0].message.content,
-                items_compared: params.operation.params.item_ids,
-                criteria_used: criteria,
-                goal_stated: goal,
-                model_used: response.data.model,
-                api_response_id: response.data.id
-              };
-            } else {
-              operationStatus = "failure";
-              errorMessage = "Compare operation failed: No response from LLM or unexpected format.";
-              operationOutput = { message: errorMessage, details: response.data };
-            }
+            const llmResultCompare = await callConfiguredLlm({ activeConfig, actualApiKey, userPrompt: fullPrompt, systemPrompt: systemPromptForCompare });
+            
+            operationOutput = {
+              comparison_id: operationIdUUID,
+              result: llmResultCompare.content,
+              items_compared: params.operation.params.item_ids,
+              criteria_used: criteria,
+              goal_stated: goal,
+              model_used: llmResultCompare.modelUsed,
+              api_response_id: llmResultCompare.apiResponseId || (llmResultCompare.rawResponse as any)?.id || "N/A"
+            };
+            // Note: The 'else' case for failure is handled by callConfiguredLlm throwing an error.
           } catch (apiError: any) {
             operationStatus = "failure";
             if (axios.isAxiosError(apiError)) {
@@ -1726,38 +1664,18 @@ server.tool(
             
             // Build the full prompt
             const fullPrompt = `${contextData}\nReflection Prompt: ${params.operation.params.reflection_prompt}`;
+            const systemPromptForReflect = "You are a helpful assistant that performs reflection and meta-cognition.";
             
-            // Call OpenRouter API
-            const response = await axios.post(
-              OPENROUTER_API_URL, // Assuming OpenRouter URL for now, or make dynamic based on activeConfig.provider
-              {
-                model: activeConfig.model,
-                messages: [
-                  { role: "system", content: "You are a helpful assistant that performs reflection and meta-cognition." },
-                  { role: "user", content: fullPrompt }
-                ],
-              },
-              {
-                headers: {
-                  "Authorization": `Bearer ${actualApiKey}`,
-                  "Content-Type": "application/json",
-                },
-              }
-            );
+            const llmResultReflect = await callConfiguredLlm({ activeConfig, actualApiKey, userPrompt: fullPrompt, systemPrompt: systemPromptForReflect });
             
-            if (response.data && response.data.choices && response.data.choices.length > 0) {
-              operationOutput = {
-                reflection_id: operationIdUUID,
-                reflection_result: response.data.choices[0].message.content,
-                targets_reflected_upon: params.operation.params.target_operation_ids,
-                model_used: response.data.model,
-                api_response_id: response.data.id
-              };
-            } else {
-              operationStatus = "failure";
-              errorMessage = "Reflect operation failed: No response from LLM or unexpected format.";
-              operationOutput = { message: errorMessage, details: response.data };
-            }
+            operationOutput = {
+              reflection_id: operationIdUUID,
+              reflection_result: llmResultReflect.content,
+              targets_reflected_upon: params.operation.params.target_operation_ids,
+              model_used: llmResultReflect.modelUsed,
+              api_response_id: llmResultReflect.apiResponseId || (llmResultReflect.rawResponse as any)?.id || "N/A"
+            };
+            // Note: The 'else' case for failure is handled by callConfiguredLlm throwing an error.
           } catch (apiError: any) {
             operationStatus = "failure";
             if (axios.isAxiosError(apiError)) {
@@ -1785,39 +1703,19 @@ Target Source: ${targetSource}
 Additional Query Parameters: ${queryParams}
 
 Please generate a well-formulated query, a series of questions, or a detailed plan to obtain the needed information.`;
+            const systemPromptForAsk = "You are a helpful assistant that formulates information requests.";
+            
+            const llmResultAsk = await callConfiguredLlm({ activeConfig, actualApiKey, userPrompt: fullPrompt, systemPrompt: systemPromptForAsk });
 
-            // Call OpenRouter API
-            const response = await axios.post(
-              OPENROUTER_API_URL, // Assuming OpenRouter URL for now, or make dynamic based on activeConfig.provider
-              {
-                model: activeConfig.model,
-                messages: [
-                  { role: "system", content: "You are a helpful assistant that formulates information requests." },
-                  { role: "user", content: fullPrompt }
-                ],
-              },
-              {
-                headers: {
-                  "Authorization": `Bearer ${actualApiKey}`,
-                  "Content-Type": "application/json",
-                },
-              }
-            );
-
-            if (response.data && response.data.choices && response.data.choices.length > 0) {
-              operationOutput = {
-                query_id: operationIdUUID,
-                formulated_query_or_plan: response.data.choices[0].message.content,
-                information_need_stated: informationNeed,
-                target_source_hint: params.operation.params.target_source, // may be undefined
-                model_used: response.data.model,
-                api_response_id: response.data.id
-              };
-            } else {
-              operationStatus = "failure";
-              errorMessage = "Ask operation failed: No response from LLM or unexpected format.";
-              operationOutput = { message: errorMessage, details: response.data };
-            }
+            operationOutput = {
+              query_id: operationIdUUID,
+              formulated_query_or_plan: llmResultAsk.content,
+              information_need_stated: informationNeed,
+              target_source_hint: params.operation.params.target_source, // may be undefined
+              model_used: llmResultAsk.modelUsed,
+              api_response_id: llmResultAsk.apiResponseId || (llmResultAsk.rawResponse as any)?.id || "N/A"
+            };
+            // Note: The 'else' case for failure is handled by callConfiguredLlm throwing an error.
           } catch (apiError: any) {
             operationStatus = "failure";
             if (axios.isAxiosError(apiError)) {
@@ -1884,39 +1782,19 @@ Please generate a well-formulated query, a series of questions, or a detailed pl
             
             // Build the prompt
             const fullPrompt = `${feedbackContent}Original Content (ID: ${opParams.target_operation_id}):\n${targetContent}\n\nAdaptation Instruction: ${opParams.adaptation_instruction}\n\nPlease provide the adapted version:`;
+            const systemPromptForAdapt = "You are a helpful assistant that adapts content based on instructions and feedback.";
             
-            // Call OpenRouter API
-            const response = await axios.post(
-              OPENROUTER_API_URL, // Assuming OpenRouter URL for now, or make dynamic based on activeConfig.provider
-              {
-                model: activeConfig.model,
-                messages: [
-                  { role: "system", content: "You are a helpful assistant that adapts content based on instructions and feedback." },
-                  { role: "user", content: fullPrompt }
-                ],
-              },
-              {
-                headers: {
-                  "Authorization": `Bearer ${actualApiKey}`,
-                  "Content-Type": "application/json",
-                },
-              }
-            );
+            const llmResultAdapt = await callConfiguredLlm({ activeConfig, actualApiKey, userPrompt: fullPrompt, systemPrompt: systemPromptForAdapt });
             
-            if (response.data && response.data.choices && response.data.choices.length > 0) {
-              operationOutput = {
-                adaptation_id: operationIdUUID,
-                adapted_content_or_suggestion: response.data.choices[0].message.content,
-                original_target_id: opParams.target_operation_id,
-                feedback_used_id: opParams.feedback_id || null,
-                model_used: response.data.model,
-                api_response_id: response.data.id
-              };
-            } else {
-              operationStatus = "failure";
-              errorMessage = "Adapt operation failed: No response from LLM or unexpected format.";
-              operationOutput = { message: errorMessage, details: response.data };
-            }
+            operationOutput = {
+              adaptation_id: operationIdUUID,
+              adapted_content_or_suggestion: llmResultAdapt.content,
+              original_target_id: opParams.target_operation_id,
+              feedback_used_id: opParams.feedback_id || null,
+              model_used: llmResultAdapt.modelUsed,
+              api_response_id: llmResultAdapt.apiResponseId || (llmResultAdapt.rawResponse as any)?.id || "N/A"
+            };
+            // Note: The 'else' case for failure is handled by callConfiguredLlm throwing an error.
           } catch (apiError: any) {
             operationStatus = "failure";
             if (axios.isAxiosError(apiError)) {
