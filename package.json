@@ -1,0 +1,31 @@
+{
+  "name": "logic-mcp",
+  "version": "0.1.0",
+  "description": "Logic MCP Server - Rebuilt",
+  "main": "build/index.js",
+  "type": "module",
+  "scripts": {
+    "build": "tsc && node -e \"require('fs').chmodSync('build/index.js', '755')\"",
+    "start": "node build/index.js",
+    "dev": "tsc-watch --onSuccess \"node build/index.js\""
+  },
+  "keywords": [
+    "mcp",
+    "logic"
+  ],
+  "author": "Roo",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "@types/sqlite3": "^3.1.11",
+    "axios": "^1.9.0",
+    "dotenv": "^16.5.0",
+    "sqlite3": "^5.1.7",
+    "zod": "^3.25.49"
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.57",
+    "tsc-watch": "^6.0.0",
+    "typescript": "^5.0.0"
+  }
+}
