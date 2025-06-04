@@ -16,8 +16,7 @@ dotenv.config();
 
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions";
-const HTTP_PORT = process.env.HTTP_PORT || '3001'; // Use HTTP_PORT from .env, default to '3001'
-const ENABLE_HTTP_API = process.env.ENABLE_HTTP_API === 'true';
+const HTTP_PORT = process.env.WEBAPP_PORT || 3001;
 
 const DB_FILE_NAME = 'logic_mcp.db';
 const DB_PATH = path.join(process.cwd(), DB_FILE_NAME); // Assumes server runs from its root dir
@@ -49,6 +48,7 @@ async function initializeDatabase() {
 CREATE TABLE IF NOT EXISTS operations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     operation_id TEXT NOT NULL UNIQUE,  -- Unique identifier for the operation
+    operation_name TEXT,                -- Human-readable name for the operation
     primitive_name TEXT NOT NULL,       -- Name of the logic primitive
     input_data TEXT,                    -- JSON-encoded input parameters
     output_data TEXT,                   -- JSON-encoded output results
@@ -73,6 +73,7 @@ CREATE TABLE IF NOT EXISTS operation_relationships (
 -- Logic chain metadata
 CREATE TABLE IF NOT EXISTS logic_chains (
     chain_id TEXT PRIMARY KEY,          -- Unique chain identifier
+    chain_name TEXT,                    -- Human-readable name for the chain
     description TEXT,                   -- Human-readable description
     root_operation INTEGER,             -- Starting operation ID
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -541,6 +542,7 @@ logicExplorerRouter.use(authenticateApiKey); // Reuse the same authentication
 // 1. List All Logic Chains
 interface LogicChainSummaryRow {
   chain_id: string;
+  chain_name: string | null; // Added
   description: string | null;
   root_operation_uuid: string | null;
   created_at: string;
@@ -554,6 +556,7 @@ const listAllLogicChainsHandler: RequestHandler = async (_req, res) => {
       const sql = `
         SELECT
           lc.chain_id,
+          lc.chain_name, -- Added
           lc.description,
           op_root.operation_id as root_operation_uuid,
           lc.created_at,
@@ -570,8 +573,9 @@ const listAllLogicChainsHandler: RequestHandler = async (_req, res) => {
         // Map to ensure the output field name matches the design doc if different from query alias
         resolve(rows.map(row => ({
             chain_id: row.chain_id,
+            chain_name: row.chain_name, // Added
             description: row.description,
-            root_operation_uuid: row.root_operation_uuid || null, // Corrected to match interface
+            root_operation_uuid: row.root_operation_uuid || null,
             created_at: row.created_at,
             operation_count: row.operation_count
         })));
@@ -599,6 +603,7 @@ const safeJsonParse = (jsonString: string | null, defaultValue: any = null) => {
 // 2. Get a Specific Logic Chain with its Operations
 interface OperationDetail {
     operation_id: string;
+    operation_name: string | null; // Added
     primitive_name: string;
     input_data: any;
     output_data: any;
@@ -618,7 +623,7 @@ const getChainWithOperationsHandler: RequestHandler = async (req, res) => {
     // 1. Fetch chain details
     const chainDetails = await new Promise<any>((resolve, reject) => {
       db.get(`
-        SELECT lc.chain_id, lc.description, op_root.operation_id as root_operation_uuid, lc.created_at
+        SELECT lc.chain_id, lc.chain_name, lc.description, op_root.operation_id as root_operation_uuid, lc.created_at
         FROM logic_chains lc
         LEFT JOIN operations op_root ON lc.root_operation = op_root.id
         WHERE lc.chain_id = ?
@@ -636,7 +641,7 @@ const getChainWithOperationsHandler: RequestHandler = async (req, res) => {
     // 2. Fetch all operations for this chain
     const operationsRaw = await new Promise<any[]>((resolve, reject) => {
       db.all(`
-        SELECT id as db_id, operation_id, primitive_name, input_data, output_data, status, start_time, end_time, context
+        SELECT id as db_id, operation_id, operation_name, primitive_name, input_data, output_data, status, start_time, end_time, context
         FROM operations
         WHERE json_extract(context, '$.chain_id') = ?
         ORDER BY start_time ASC
@@ -653,6 +658,7 @@ const getChainWithOperationsHandler: RequestHandler = async (req, res) => {
       const detail: OperationDetail = {
         db_id: op.db_id,
         operation_id: op.operation_id,
+        operation_name: op.operation_name, // Added
         primitive_name: op.primitive_name,
         input_data: safeJsonParse(op.input_data, {}),
         output_data: safeJsonParse(op.output_data, {}),
@@ -706,6 +712,7 @@ const getChainWithOperationsHandler: RequestHandler = async (req, res) => {
 
     res.status(200).json({
       chain_id: chainDetails.chain_id,
+      chain_name: chainDetails.chain_name, // Added
       description: chainDetails.description,
       root_operation_id: chainDetails.root_operation_uuid || null,
       created_at: chainDetails.created_at,
@@ -728,7 +735,7 @@ const getOperationDetailsHandler: RequestHandler = async (req, res) => {
     // 1. Fetch operation details
     const operationRaw = await new Promise<any>((resolve, reject) => {
       db.get(`
-        SELECT id as db_id, operation_id, primitive_name, input_data, output_data, status, start_time, end_time, context
+        SELECT id as db_id, operation_id, operation_name, primitive_name, input_data, output_data, status, start_time, end_time, context
         FROM operations
         WHERE operation_id = ?
       `, [operationId], (err, row) => {
@@ -745,6 +752,7 @@ const getOperationDetailsHandler: RequestHandler = async (req, res) => {
     const operationDetail: OperationDetail = {
       db_id: operationRaw.db_id,
       operation_id: operationRaw.operation_id,
+      operation_name: operationRaw.operation_name, // Added missing field
       primitive_name: operationRaw.primitive_name,
       input_data: safeJsonParse(operationRaw.input_data, {}),
       output_data: safeJsonParse(operationRaw.output_data, {}),
@@ -818,6 +826,7 @@ logicExplorerRouter.get('/operations/:operationId', getOperationDetailsHandler);
 // 4. Get Operation Relationships (Parents/Children)
 interface OperationRelationshipSummary {
     operation_id: string;
+    operation_name: string | null; // Added
     primitive_name: string;
 }
 const getOperationRelationshipsHandler: RequestHandler = async (req, res) => {
@@ -843,32 +852,32 @@ const getOperationRelationshipsHandler: RequestHandler = async (req, res) => {
         // 2. Fetch parent relationships (operations that are parents to currentOpDbId)
         const parentRels = await new Promise<OperationRelationshipSummary[]>((resolve, reject) => {
             db.all(`
-                SELECT o.operation_id, o.primitive_name
+                SELECT o.operation_id, o.operation_name, o.primitive_name
                 FROM operation_relationships rel
                 JOIN operations o ON rel.parent_id = o.id
                 WHERE rel.child_id = ?
-            `, [currentOpDbId], (err, rows: any[]) => { // Explicitly type rows as any[] for now
+            `, [currentOpDbId], (err, rows: any[]) => {
                 if (err) {
                     reject(err);
                     return;
                 }
-                resolve(rows as OperationRelationshipSummary[]);
+                resolve(rows.map(r => ({ operation_id: r.operation_id, operation_name: r.operation_name, primitive_name: r.primitive_name })));
             });
         });
         
         // 3. Fetch child relationships (operations that are children of currentOpDbId)
         const childRels = await new Promise<OperationRelationshipSummary[]>((resolve, reject) => {
             db.all(`
-                SELECT o.operation_id, o.primitive_name
+                SELECT o.operation_id, o.operation_name, o.primitive_name
                 FROM operation_relationships rel
                 JOIN operations o ON rel.child_id = o.id
                 WHERE rel.parent_id = ?
-            `, [currentOpDbId], (err, rows: any[]) => { // Explicitly type rows as any[] for now
+            `, [currentOpDbId], (err, rows: any[]) => {
                 if (err) {
                     reject(err);
                     return;
                 }
-                resolve(rows as OperationRelationshipSummary[]);
+                resolve(rows.map(r => ({ operation_id: r.operation_id, operation_name: r.operation_name, primitive_name: r.primitive_name })));
             });
         });
 
@@ -886,28 +895,12 @@ const getOperationRelationshipsHandler: RequestHandler = async (req, res) => {
 logicExplorerRouter.get('/operations/:operationId/relationships', getOperationRelationshipsHandler);
 
 app.use('/api/logic-explorer', logicExplorerRouter);
-
-// Helper function to start HTTP server and return a promise
-function startHttpServer(appInstance: express.Application, port: number): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const serverInstance = appInstance.listen(port, () => {
-      console.log(`HTTP API server listening on port ${port}`);
-      resolve(); // Resolve when server is listening
-    });
-    serverInstance.on('error', (err: any) => {
-      console.error(`HTTP API server failed to start on port ${port}:`, err);
-      if (err.code === 'EADDRINUSE') {
-        console.error(`Port ${port} is already in use. Please use a different port or stop the other application using it.`);
-      }
-      reject(err); // Reject the promise if server fails to start
-    });
-  });
-}
-
 // --- Tool Input Schema ---
 const executeLogicOperationInputSchema = z.object({
   chain_id: z.string().uuid().optional().describe("ID of the logic chain. If not provided, a new chain is created and its ID returned."),
+  chain_name: z.string().optional().describe("Optional human-readable name for a new chain if chain_id is not provided."),
   parent_operation_id: z.string().uuid().optional().describe("ID of the parent operation in this chain, for explicit sequencing. Helps build the execution graph."),
+  operation_name: z.string().optional().describe("Optional human-readable name for this specific operation."),
   branch_id: z.string().optional().describe("Identifier for a parallel branch of logic within the same chain. Operations with the same branch_id form a sequence within that branch."),
   operation: operationSchema,
 }).describe("Input for executing a single step in a logic chain.");
@@ -941,11 +934,19 @@ server.tool(
       // 1. Ensure chain exists or create it
       if (!currentChainId) {
         isNewChain = true;
-        currentChainId = randomUUID();
+        const newChainUUID = randomUUID(); // Generate UUID first
+        currentChainId = newChainUUID;     // Assign to currentChainId, now it's definitely a string
+
+        // Define default operation name, potentially used in default chain name
+        const defaultOperationNameForChain = params.operation_name || `${params.operation.type.charAt(0).toUpperCase() + params.operation.type.slice(1)} Operation No. ${operationIdUUID.substring(0, 4)}`;
+        // Use newChainUUID for safety in string interpolation as currentChainId's type might not be narrowed yet by TS for this line
+        const chainName = params.chain_name || `Chain started with ${defaultOperationNameForChain} (${newChainUUID.substring(0,4)})`;
+        const chainDescription = `Chain initiated by a '${params.operation.type}' operation.`;
+
         await new Promise<void>((resolve, reject) => {
           db.run(
-            "INSERT INTO logic_chains (chain_id, description, created_at) VALUES (?, ?, ?)",
-            [currentChainId, `Chain started with ${params.operation.type} operation`, startTime],
+            "INSERT INTO logic_chains (chain_id, chain_name, description, created_at) VALUES (?, ?, ?, ?)",
+            [newChainUUID, chainName, chainDescription, startTime], // Use newChainUUID for insertion
             (err) => {
               if (err) {
                 console.error("Error creating new chain:", err);
@@ -1753,21 +1754,24 @@ Please generate a well-formulated query, a series of questions, or a detailed pl
       .digest('hex');
 
     // 3. Insert operation into DB
+    const operationName = params.operation_name || `${params.operation.type.charAt(0).toUpperCase() + params.operation.type.slice(1)} Operation No. ${operationIdUUID.substring(0, 4)}`;
+
     const dbOperationInternalId = await new Promise<number>((resolve, reject) => {
       db.run(
-        `INSERT INTO operations (operation_id, primitive_name, input_data, output_data, status, start_time, end_time, context)
-         VALUES (?, ?, ?, ?, ?, ?, ?, json_object('chain_id', ?, 'branch_id', ?, 'parent_operation_uuid', ?, 'hash', ?))`,
+        `INSERT INTO operations (operation_id, operation_name, primitive_name, input_data, output_data, status, start_time, end_time, context)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, json_object('chain_id', ?, 'branch_id', ?, 'parent_operation_uuid', ?, 'hash', ?))`,
         [
           operationIdUUID,
+          operationName, // Added operation_name
           params.operation.type,
           inputDataString,
           outputDataString,
           operationStatus,
           startTime,
           endTime,
-          currentChainId, // Store chain_id in context as well for easier querying if needed
+          currentChainId,
           params.branch_id,
-          params.parent_operation_id, // Store the UUID of the parent
+          params.parent_operation_id,
           hash
         ],
         function (this: sqlite3.RunResult, err) {
@@ -1849,17 +1853,10 @@ async function main() {
   try {
     await initializeDatabase();
 
-    if (ENABLE_HTTP_API) {
-      const port = parseInt(HTTP_PORT, 10);
-      if (isNaN(port) || port < 1 || port > 65535) {
-        throw new Error(`Invalid HTTP_PORT: '${HTTP_PORT}'. Must be a number between 1-65535`);
-      }
-
-      console.log(`Attempting to start HTTP API server on port ${port}...`);
-      await startHttpServer(app, port);
-    } else {
-      console.log("HTTP API is disabled. Set ENABLE_HTTP_API=true in .env to enable it.");
-    }
+    // Start HTTP server for API
+    app.listen(HTTP_PORT, () => {
+      console.log(`HTTP API server listening on port ${HTTP_PORT}`);
+    });
 
     // Start MCP server
     const transport = new StdioServerTransport();
