@@ -18,6 +18,11 @@ const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions";
 const HTTP_PORT = process.env.WEBAPP_PORT || 3001;
 
+// Default LLM Configuration Constants
+const DEFAULT_LLM_PROVIDER = "openrouter";
+const DEFAULT_LLM_MODEL = "deepseek/deepseek-r1-0528:free";
+// The key for this default will be derived (e.g., OPENROUTER_API_KEY)
+
 const DB_FILE_NAME = 'logic_mcp.db';
 const DB_PATH = path.join(process.cwd(), DB_FILE_NAME); // Assumes server runs from its root dir
 
@@ -25,9 +30,39 @@ let db: sqlite3.Database;
 
 const app = express();
 
-// Middleware
+// Add error event listeners to catch any unhandled errors
+process.on('uncaughtException', (error) => {
+  console.error('UNCAUGHT EXCEPTION:', error);
+  console.error('Stack:', error.stack);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('UNHANDLED REJECTION at:', promise, 'reason:', reason);
+});
+
+// New Global Logging Middleware - Add this EARLY
+app.use((req, res, next) => {
+  console.log(`GLOBAL LOGGER: Received ${req.method} request for ${req.originalUrl}`);
+  console.log('GLOBAL LOGGER: Headers:', JSON.stringify(req.headers));
+  // Don't try to read body here as it conflicts with express.json()
+  next();
+});
+
+// Middleware with error handling
 app.use(cors()); // Enable CORS for all routes
-app.use(express.json()); // Parse JSON request bodies
+
+// Wrap express.json() to catch parsing errors
+app.use((req, res, next) => {
+  express.json()(req, res, (err) => {
+    if (err) {
+      console.error('JSON PARSING ERROR:', err);
+      console.error('Failed on request:', req.method, req.originalUrl);
+      res.status(400).json({ error: 'Invalid JSON', details: err.message });
+      return;
+    }
+    next();
+  });
+});
 
 async function initializeDatabase() {
   return new Promise<void>((resolve, reject) => {
@@ -98,7 +133,6 @@ CREATE TABLE IF NOT EXISTS llm_configurations (
   id TEXT PRIMARY KEY, -- UUID for unique identification of each configuration
   provider TEXT NOT NULL, -- e.g., "OpenRouter", "OpenAI", "Anthropic"
   model TEXT NOT NULL, -- e.g., "deepseek/deepseek-r1-0528:free", "gpt-4o-mini", "claude-3-opus-20240229"
-  api_key_id TEXT NOT NULL, -- Reference to a secure key management system (e.g., "openrouter_prod_key_id")
   is_active BOOLEAN NOT NULL DEFAULT FALSE, -- Only one configuration can be active at a time
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
@@ -115,50 +149,55 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_active_llm_config ON llm_configurations (i
         }
         console.log('Database schema applied successfully.');
 
-        // Check and add chain_name column to logic_chains table
-        db.all(`PRAGMA table_info(logic_chains);`, (err, columns: any[]) => {
-          if (err) {
-            console.error('Error checking logic_chains schema:', err.message);
-            return reject(err);
-          }
-          const hasChainName = columns.some(col => col.name === 'chain_name');
-          if (!hasChainName) {
-            db.exec(`ALTER TABLE logic_chains ADD COLUMN chain_name TEXT;`, (alterErr) => {
-              if (alterErr) {
-                console.error('Error adding chain_name column to logic_chains:', alterErr.message);
-                return reject(alterErr);
-              }
-              console.log("Added chain_name column to logic_chains table.");
-              // Proceed to check operations table after this alter is done
-              checkAndAddOperationNameColumn();
-            });
-          } else {
-            // If chain_name already exists, proceed to check operations table
-            checkAndAddOperationNameColumn();
-          }
-        });
-
-        function checkAndAddOperationNameColumn() {
-          // Check and add operation_name column to operations table
-          db.all(`PRAGMA table_info(operations);`, (err, columns: any[]) => {
+        try {
+          // Check and add chain_name column if it doesn't exist
+          db.all(`PRAGMA table_info(logic_chains);`, (err, columns: any[]) => {
             if (err) {
-              console.error('Error checking operations schema:', err.message);
+              console.error('Error checking logic_chains schema:', err.message);
               return reject(err);
             }
-            const hasOperationName = columns.some(col => col.name === 'operation_name');
-            if (!hasOperationName) {
-              db.exec(`ALTER TABLE operations ADD COLUMN operation_name TEXT;`, (alterErr) => {
+            const hasChainName = columns.some(col => col.name === 'chain_name');
+            if (!hasChainName) {
+              db.exec(`ALTER TABLE logic_chains ADD COLUMN chain_name TEXT;`, (alterErr) => {
                 if (alterErr) {
-                  console.error('Error adding operation_name column to operations:', alterErr.message);
+                  console.error('Error adding chain_name column to logic_chains:', alterErr.message);
                   return reject(alterErr);
                 }
-                console.log("Added operation_name column to operations table.");
-                resolve(); // All checks and alters are done
+                console.log("Added chain_name column to logic_chains table.");
+                // Proceed to check operations table after this alter is done
+                checkAndAddOperationNameColumn();
               });
             } else {
-              resolve(); // All checks and alters are done
+              // If chain_name already exists, proceed to check operations table
+              checkAndAddOperationNameColumn();
             }
           });
+
+          function checkAndAddOperationNameColumn() {
+            // Check and add operation_name column to operations table
+            db.all(`PRAGMA table_info(operations);`, (err, columns: any[]) => {
+              if (err) {
+                console.error('Error checking operations schema:', err.message);
+                return reject(err);
+              }
+              const hasOperationName = columns.some(col => col.name === 'operation_name');
+              if (!hasOperationName) {
+                db.exec(`ALTER TABLE operations ADD COLUMN operation_name TEXT;`, (alterErr) => {
+                  if (alterErr) {
+                    console.error('Error adding operation_name column to operations:', alterErr.message);
+                    return reject(alterErr);
+                  }
+                  console.log("Added operation_name column to operations table.");
+                  resolve(); // All checks and alters are done
+                });
+              } else {
+                resolve(); // All checks and alters are done
+              }
+            });
+          }
+        } catch (syncError: any) {
+          console.error('Synchronous error during database schema checks:', syncError.message);
+          reject(syncError);
         }
       });
     });
@@ -269,6 +308,11 @@ const operationSchema = z.discriminatedUnion("type", [
 ]).describe("Defines the type of logic operation to perform and its specific parameters.");
 // --- API Routes for LLM Configuration ---
 const llmConfigRouter: Router = express.Router();
+// New logging middleware for this router
+llmConfigRouter.use((req, res, next) => {
+  console.log(`llmConfigRouter: Request received for ${req.method} ${req.originalUrl} (path on router: ${req.path})`);
+  next();
+});
 
 const WEB_APP_API_KEY = process.env.MCP_SERVER_API_KEY_FOR_WEBAPP;
 
@@ -294,54 +338,54 @@ if (token !== WEB_APP_API_KEY) {
 next();
 };
 
-llmConfigRouter.use('/', authenticateApiKey); // Apply auth to all llm-config routes, explicitly providing base path
+// llmConfigRouter.use('/', authenticateApiKey); // Apply auth to all llm-config routes, explicitly providing base path
 
 // 1. Create a New LLM Configuration
 const createLlmConfigHandler: RequestHandler = async (req, res, _next) => {
-  const { provider, model, api_key: raw_api_key_from_request } = req.body;
+  console.log("createLlmConfigHandler: Entered");
+  console.log("createLlmConfigHandler: Request body:", JSON.stringify(req.body));
+  const { provider, model } = req.body;
 
-  if (!provider || !model || !raw_api_key_from_request) {
-    res.status(400).json({ error: "Missing required fields: provider, model, and api_key are required." });
+  if (!provider || !model) {
+    res.status(400).json({ error: "Missing required fields: provider and model are required." });
     return;
   }
-  if (typeof provider !== 'string' || typeof model !== 'string' || typeof raw_api_key_from_request !== 'string') {
-    res.status(400).json({ error: "Invalid data types for provider, model, or api_key." });
+  if (typeof provider !== 'string' || typeof model !== 'string') {
+    res.status(400).json({ error: "Invalid data types for provider or model." });
     return;
   }
 
   const newConfigId = randomUUID(); // from 'crypto' import
-  const apiKeyId = randomUUID(); // This is the ID we store, not the raw key.
   const currentTime = new Date().toISOString();
 
-  // IMPORTANT: The raw_api_key_from_request is NOT stored in the database.
-  // The user/admin is responsible for setting an environment variable named after `apiKeyId`
-  // with the value of `raw_api_key_from_request` for the server to use it.
-  // e.g., if apiKeyId is "abc-123", set env var "abc-123"="sk-actualkey"
-
   try {
+    console.log("createLlmConfigHandler: Attempting to insert:", newConfigId, provider, model);
     await new Promise<void>((resolve, reject) => {
       db.run(
-        `INSERT INTO llm_configurations (id, provider, model, api_key_id, is_active, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        [newConfigId, provider, model, apiKeyId, false, currentTime, currentTime],
+        `INSERT INTO llm_configurations (id, provider, model, is_active, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [newConfigId, provider, model, false, currentTime, currentTime],
         function (this: sqlite3.RunResult, err) {
           if (err) {
             console.error("Error inserting LLM configuration:", err);
             reject(err); // Ensure promise is rejected on error
             return;
           }
+          console.log("createLlmConfigHandler: Insert successful for ID:", newConfigId);
           resolve();
         }
       );
     });
 
     // Fetch the newly created record to return it
+    console.log("createLlmConfigHandler: Attempting to fetch new record for ID:", newConfigId);
     const newRecord = await new Promise<any>((resolve, reject) => {
-        db.get("SELECT id, provider, model, api_key_id, is_active, created_at, updated_at FROM llm_configurations WHERE id = ?", [newConfigId], (err, row) => {
+        db.get("SELECT id, provider, model, is_active, created_at, updated_at FROM llm_configurations WHERE id = ?", [newConfigId], (err, row) => {
             if (err) {
                 reject(err); // Ensure promise is rejected on error
                 return;
             }
+            console.log("createLlmConfigHandler: Fetched new record:", JSON.stringify(row));
             resolve(row);
         });
     });
@@ -353,13 +397,16 @@ const createLlmConfigHandler: RequestHandler = async (req, res, _next) => {
         return;
     }
     
+    const expectedEnvVarName = `${provider.toUpperCase().replace(/-/g, '_')}_API_KEY`;
     // Log the action and remind about setting the actual API key in environment
-    console.log(`Created new LLM config: ID=${newConfigId}, Provider=${provider}, Model=${model}, API_Key_ID=${apiKeyId}`);
-    console.warn(`ACTION REQUIRED: To use this configuration, set an environment variable named "${apiKeyId}" with the actual API key value.`);
+    console.log(`Created new LLM config: ID=${newConfigId}, Provider=${provider}, Model=${model}`);
+    console.warn(`ACTION REQUIRED: To use this configuration, ensure the environment variable "${expectedEnvVarName}" is set with the actual API key value in your .env file.`);
 
-    res.status(201).json(newRecord);
+    const responsePayload = { ...newRecord, message: `Configuration for ${provider} saved. Ensure ${expectedEnvVarName} is set in your .env file.` };
+    console.log("createLlmConfigHandler: Sending 201 response with:", JSON.stringify(responsePayload));
+    res.status(201).json(responsePayload);
   } catch (error: any) {
-    console.error("Error in POST /api/llm-config:", error);
+    console.error("createLlmConfigHandler: CAUGHT ERROR:", error, error.stack);
     res.status(500).json({ error: "Internal Server Error", details: error.message });
   }
 };
@@ -369,8 +416,8 @@ llmConfigRouter.post('/', createLlmConfigHandler);
 // 2. Get All LLM Configurations
 const getAllLlmConfigsHandler: RequestHandler = async (_req, res) => {
   try {
-    const rows = await new Promise<any[]>((resolve, reject) => {
-      db.all("SELECT id, provider, model, api_key_id, is_active, created_at, updated_at FROM llm_configurations ORDER BY created_at DESC", (err, rows) => {
+    const userConfigs = await new Promise<any[]>((resolve, reject) => {
+      db.all("SELECT id, provider, model, is_active, created_at, updated_at FROM llm_configurations ORDER BY created_at DESC", (err, rows) => {
         if (err) {
           console.error("Error fetching LLM configurations:", err);
           reject(err);
@@ -379,7 +426,24 @@ const getAllLlmConfigsHandler: RequestHandler = async (_req, res) => {
         resolve(rows);
       });
     });
-    res.status(200).json(rows);
+
+    const isAnyUserConfigActive = userConfigs.some(c => c.is_active === 1 || c.is_active === true);
+
+    const defaultServerConfig = {
+        id: 'SERVER_DEFAULT_CONFIG',
+        provider: DEFAULT_LLM_PROVIDER,
+        model: DEFAULT_LLM_MODEL,
+        // The default is considered "active" for display if no other user config is explicitly active.
+        // Actual server usage of default relies on getLlmConfigAndKey fallback.
+        is_active: !isAnyUserConfigActive,
+        created_at: 'N/A',
+        updated_at: 'N/A',
+        is_default: true,
+        is_immutable: true // This means it cannot be deleted by user. Activation is handled specially.
+    };
+
+    const allConfigsToReturn = [defaultServerConfig, ...userConfigs];
+    res.status(200).json(allConfigsToReturn);
   } catch (error: any) {
     console.error("Error in GET /api/llm-config:", error);
     res.status(500).json({ error: "Internal Server Error", details: error.message });
@@ -393,7 +457,7 @@ const getLlmConfigByIdHandler: RequestHandler = async (req, res) => {
   const { id } = req.params;
   try {
     const row = await new Promise<any>((resolve, reject) => {
-      db.get("SELECT id, provider, model, api_key_id, is_active, created_at, updated_at FROM llm_configurations WHERE id = ?", [id], (err, row) => {
+      db.get("SELECT id, provider, model, is_active, created_at, updated_at FROM llm_configurations WHERE id = ?", [id], (err, row) => {
         if (err) {
           console.error(`Error fetching LLM configuration with ID ${id}:`, err);
           reject(err);
@@ -455,7 +519,7 @@ const updateLlmConfigHandler: RequestHandler = async (req, res) => {
 
     // Fetch and return the updated record
     const updatedRecord = await new Promise<any>((resolve, reject) => {
-      db.get("SELECT id, provider, model, api_key_id, is_active, created_at, updated_at FROM llm_configurations WHERE id = ?", [id], (err, row) => {
+      db.get("SELECT id, provider, model, is_active, created_at, updated_at FROM llm_configurations WHERE id = ?", [id], (err, row) => {
         if (err) reject(err);
         else resolve(row);
       });
@@ -470,63 +534,81 @@ const updateLlmConfigHandler: RequestHandler = async (req, res) => {
 
 llmConfigRouter.put('/:id', updateLlmConfigHandler);
 
-// 5. Activate an LLM Configuration
+// 5. Activate an LLM Configuration (User-defined or Server Default)
 const activateLlmConfigHandler: RequestHandler = async (req, res) => {
   const { id } = req.params;
   const currentTime = new Date().toISOString();
 
   try {
-    await new Promise<void>((resolve, reject) => {
-      db.serialize(() => {
-        db.run("BEGIN TRANSACTION;", (errBegin) => {
-          if (errBegin) return reject(errBegin);
+    if (id === 'SERVER_DEFAULT_CONFIG') {
+      // Activating the server default means deactivating all user-defined configs
+      await new Promise<void>((resolve, reject) => {
+        db.run("UPDATE llm_configurations SET is_active = FALSE, updated_at = ? WHERE is_active = TRUE", [currentTime], (err) => {
+          if (err) {
+            console.error("Error deactivating user LLM configurations for default activation:", err);
+            return reject(err);
+          }
+          console.log("All user LLM configurations deactivated. Server default is now effectively active.");
+          resolve();
+        });
+      });
+      // Return a representation of the default config as if it were an activated record
+      res.status(200).json({
+        id: 'SERVER_DEFAULT_CONFIG',
+        provider: DEFAULT_LLM_PROVIDER,
+        model: DEFAULT_LLM_MODEL,
+        is_active: true, // Signifying default is now the one to be used
+        created_at: 'N/A',
+        updated_at: currentTime,
+        is_default: true,
+        is_immutable: true,
+        message: "Server default LLM configuration activated."
+      });
+    } else {
+      // Activating a specific user-defined configuration
+      await new Promise<void>((resolve, reject) => {
+        db.serialize(() => {
+          db.run("BEGIN TRANSACTION;", (errBegin) => {
+            if (errBegin) return reject(errBegin);
 
-          // Deactivate all other configurations
-          db.run("UPDATE llm_configurations SET is_active = FALSE, updated_at = ? WHERE is_active = TRUE", [currentTime], (errUpdateAll) => {
-            if (errUpdateAll) {
-              db.run("ROLLBACK;", () => reject(errUpdateAll));
-              return;
-            }
-
-            // Activate the specified configuration
-            db.run("UPDATE llm_configurations SET is_active = TRUE, updated_at = ? WHERE id = ?", [currentTime, id], function (this: sqlite3.RunResult, errUpdateOne) {
-              if (errUpdateOne) {
-                db.run("ROLLBACK;", () => reject(errUpdateOne));
+            db.run("UPDATE llm_configurations SET is_active = FALSE, updated_at = ? WHERE is_active = TRUE", [currentTime], (errUpdateAll) => {
+              if (errUpdateAll) {
+                db.run("ROLLBACK;", () => reject(errUpdateAll));
                 return;
               }
-              if (this.changes === 0) {
-                db.run("ROLLBACK;", () => reject(new Error(`LLM Configuration with ID ${id} not found for activation.`)));
-                return;
-              }
-              db.run("COMMIT;", (errCommit) => {
-                if (errCommit) return reject(errCommit);
-                resolve();
+              db.run("UPDATE llm_configurations SET is_active = TRUE, updated_at = ? WHERE id = ?", [currentTime, id], function (this: sqlite3.RunResult, errUpdateOne) {
+                if (errUpdateOne) {
+                  db.run("ROLLBACK;", () => reject(errUpdateOne));
+                  return;
+                }
+                if (this.changes === 0) {
+                  db.run("ROLLBACK;", () => reject(new Error(`LLM Configuration with ID ${id} not found for activation.`)));
+                  return;
+                }
+                db.run("COMMIT;", (errCommit) => {
+                  if (errCommit) return reject(errCommit);
+                  resolve();
+                });
               });
             });
           });
         });
       });
-    });
 
-    // Fetch and return the newly activated record
-    const activatedRecord = await new Promise<any>((resolve, reject) => {
-      db.get("SELECT id, provider, model, api_key_id, is_active, created_at, updated_at FROM llm_configurations WHERE id = ?", [id], (err, row) => {
-        if (err) reject(err);
-        else resolve(row);
+      const activatedRecord = await new Promise<any>((resolve, reject) => {
+        db.get("SELECT id, provider, model, is_active, created_at, updated_at FROM llm_configurations WHERE id = ?", [id], (err, row) => {
+          if (err) reject(err);
+          else resolve(row);
+        });
       });
-    });
-    
-    if (!activatedRecord) {
-        // This case should be caught by the 'changes === 0' check in the transaction
-        res.status(404).json({ error: `LLM Configuration with ID ${id} not found.` });
+      
+      if (!activatedRecord) {
+        res.status(404).json({ error: `LLM Configuration with ID ${id} not found post-activation attempt.` });
         return;
+      }
+      console.log(`Activated user LLM config: ID=${id}.`);
+      res.status(200).json(activatedRecord);
     }
-
-    // TODO: Implement hot-reloading mechanism for logic-mcp server here or via webhook
-    console.log(`Activated LLM config: ID=${id}. Hot-reload to be implemented.`);
-
-    res.status(200).json(activatedRecord);
-
   } catch (error: any) {
     console.error(`Error in PATCH /api/llm-config/${id}/activate:`, error);
     if (error.message && error.message.includes("not found for activation")) {
@@ -538,6 +620,30 @@ const activateLlmConfigHandler: RequestHandler = async (req, res) => {
 };
 
 llmConfigRouter.patch('/:id/activate', activateLlmConfigHandler);
+
+// NEW: Delete All LLM Configurations
+const deleteAllLlmConfigsHandler: RequestHandler = async (_req, res) => {
+  console.log("deleteAllLlmConfigsHandler: Entered");
+  try {
+    console.log("deleteAllLlmConfigsHandler: Attempting to delete all llm_configurations");
+    await new Promise<void>((resolve, reject) => {
+      db.run("DELETE FROM llm_configurations;", function (this: sqlite3.RunResult, err) {
+        if (err) {
+          console.error("Error deleting all LLM configurations:", err);
+          reject(err);
+          return;
+        }
+        console.log(`deleteAllLlmConfigsHandler: Deletion successful. Rows affected: ${this.changes}`);
+        resolve();
+      });
+    });
+    console.log("deleteAllLlmConfigsHandler: Sending 204 response");
+    res.status(204).send(); // No Content
+  } catch (error: any) {
+    console.error("deleteAllLlmConfigsHandler: CAUGHT ERROR:", error, error.stack);
+    res.status(500).json({ error: "Internal Server Error", details: error.message });
+  }
+};
 
 // 6. Delete an LLM Configuration
 const deleteLlmConfigHandler: RequestHandler = async (req, res) => {
@@ -569,6 +675,8 @@ const deleteLlmConfigHandler: RequestHandler = async (req, res) => {
   }
 };
 
+// Ensure '/all' is registered before '/:id'
+llmConfigRouter.delete('/all', deleteAllLlmConfigsHandler);
 llmConfigRouter.delete('/:id', deleteLlmConfigHandler);
 
 // 7. Webhook for Hot-Reloading (Internal)
@@ -945,6 +1053,64 @@ const getOperationRelationshipsHandler: RequestHandler = async (req, res) => {
 };
 logicExplorerRouter.get('/operations/:operationId/relationships', getOperationRelationshipsHandler);
 
+// NEW: Delete All Logic Chains and Related Data
+const deleteAllLogicChainsHandler: RequestHandler = async (_req, res) => {
+  try {
+    await new Promise<void>((resolve, reject) => {
+      db.serialize(() => {
+        db.run("BEGIN TRANSACTION;", (errBegin) => {
+          if (errBegin) return reject(errBegin);
+
+          db.run("DELETE FROM operation_relationships;", function (this: sqlite3.RunResult, errRel) {
+            if (errRel) {
+              console.error("Error deleting from operation_relationships:", errRel);
+              db.run("ROLLBACK;", () => reject(errRel));
+              return;
+            }
+            console.log(`Deleted from operation_relationships. Rows affected: ${this.changes}`);
+
+            db.run("DELETE FROM operations;", function (this: sqlite3.RunResult, errOps) {
+              if (errOps) {
+                console.error("Error deleting from operations:", errOps);
+                db.run("ROLLBACK;", () => reject(errOps));
+                return;
+              }
+              console.log(`Deleted from operations. Rows affected: ${this.changes}`);
+
+              db.run("DELETE FROM logic_chains;", function (this: sqlite3.RunResult, errChains) {
+                if (errChains) {
+                  console.error("Error deleting from logic_chains:", errChains);
+                  db.run("ROLLBACK;", () => reject(errChains));
+                  return;
+                }
+                console.log(`Deleted from logic_chains. Rows affected: ${this.changes}`);
+
+                db.run("COMMIT;", (errCommit) => {
+                  if (errCommit) {
+                    console.error("Error committing transaction:", errCommit);
+                    return reject(errCommit);
+                  }
+                  console.log("All logic chains and related operations deleted successfully.");
+                  resolve();
+                });
+              });
+            });
+          });
+        });
+      });
+    });
+    res.status(204).send(); // No Content
+  } catch (error: any) {
+    console.error("Error in DELETE /api/logic-explorer/chains/all:", error);
+    // Ensure rollback is attempted if transaction was started and error occurred before commit/rollback
+    // This is a bit tricky here as the promise might reject before db.run("ROLLBACK") is called from within.
+    // For simplicity, we rely on the catch within the promise to handle rollback.
+    res.status(500).json({ error: "Internal Server Error", details: error.message });
+  }
+};
+
+logicExplorerRouter.delete('/chains/all', deleteAllLogicChainsHandler);
+
 app.use('/api/logic-explorer', logicExplorerRouter);
 // --- Tool Input Schema ---
 const executeLogicOperationInputSchema = z.object({
@@ -975,6 +1141,42 @@ server.tool(
   async (params) => {
     const operationIdUUID = randomUUID(); // This is the public UUID for the operation
     const startTime = new Date().toISOString();
+
+    // Helper function to get active LLM config and API key
+    const getLlmConfigAndKey = async () => {
+      // 1. Try to get user-defined active config
+      const userActiveConfig = await new Promise<{ provider: string; model: string } | undefined>((resolve, reject) => {
+        db.get("SELECT provider, model FROM llm_configurations WHERE is_active = TRUE", (err, row: any) => {
+          if (err) return reject(err); // DB query error
+          resolve(row); // row will be undefined if no active config
+        });
+      });
+
+      if (userActiveConfig) {
+        // User has an active config, try to use it
+        console.log(`Using active user LLM configuration: ${userActiveConfig.provider} - ${userActiveConfig.model}`);
+        const expectedEnvVarName = `${userActiveConfig.provider.toUpperCase().replace(/-/g, '_')}_API_KEY`;
+        const actualApiKey = process.env[expectedEnvVarName];
+        if (!actualApiKey) {
+          throw new Error(`Environment variable ${expectedEnvVarName} for active config '${userActiveConfig.provider}/${userActiveConfig.model}' is not set. Please set it in the .env file.`);
+        }
+        return { activeConfig: { provider: userActiveConfig.provider, model: userActiveConfig.model }, actualApiKey };
+      } else {
+        // No user-defined active config, fall back to server default
+        console.log("No active user LLM configuration found. Attempting to use server default.");
+        const defaultProvider = DEFAULT_LLM_PROVIDER;
+        const defaultModel = DEFAULT_LLM_MODEL;
+        const expectedDefaultEnvVarName = `${defaultProvider.toUpperCase().replace(/-/g, '_')}_API_KEY`;
+        const actualDefaultApiKey = process.env[expectedDefaultEnvVarName];
+
+        if (!actualDefaultApiKey) {
+          throw new Error(`No active user LLM configuration, and the default server configuration (provider: ${defaultProvider}) requires environment variable ${expectedDefaultEnvVarName} which is not set.`);
+        }
+        console.log(`Using server default LLM configuration: ${defaultProvider} - ${defaultModel}`);
+        return { activeConfig: { provider: defaultProvider, model: defaultModel }, actualApiKey: actualDefaultApiKey };
+      }
+      // The outer try/catch in execute_logic_operation will handle errors thrown from here.
+    };
     let operationOutput: any = { message: "Operation processed (stub)." };
     let operationStatus: "success" | "failure" = "success";
     let errorMessage: string | undefined;
@@ -1036,14 +1238,8 @@ server.tool(
           operationOutput = { observation_id: operationIdUUID, data_summary: `Observed: ${params.operation.params.source_description}`, raw_data_preview: params.operation.params.raw_data ? String(params.operation.params.raw_data).substring(0,100) : "N/A" };
           break;
         case "define":
-          if (!OPENROUTER_API_KEY) {
-            operationStatus = "failure";
-            errorMessage = "OpenRouter API key is not configured in .env file for define operation.";
-            operationOutput = { message: errorMessage };
-            console.error(errorMessage);
-            break;
-          }
           try {
+            const { activeConfig, actualApiKey } = await getLlmConfigAndKey();
             let contextData = "";
             
             // Fetch observation data if IDs are provided
@@ -1072,37 +1268,73 @@ server.tool(
             const descriptionPart = params.operation.params.description ? `Description: ${params.operation.params.description}\n` : '';
             const fullPrompt = `Define the concept: '${conceptName}'\n\n${descriptionPart}${contextData}Please provide a comprehensive definition:`;
             
-            // Call OpenRouter API
-            const response = await axios.post(
-              OPENROUTER_API_URL,
-              {
-                model: "deepseek/deepseek-r1-0528:free",
-                messages: [
-                  { role: "system", content: "You are a helpful assistant that provides clear, concise definitions of concepts." },
-                  { role: "user", content: fullPrompt }
-                ],
-              },
-              {
-                headers: {
-                  "Authorization": `Bearer ${OPENROUTER_API_KEY}`,
-                  "Content-Type": "application/json",
-                },
-              }
-            );
-            
-            if (response.data && response.data.choices && response.data.choices.length > 0) {
-              operationOutput = {
-                definition_id: operationIdUUID,
-                concept_defined: conceptName,
-                generated_definition: response.data.choices[0].message.content,
-                based_on_observations: params.operation.params.based_on_observation_ids || [],
-                model_used: response.data.model,
-                api_response_id: response.data.id
+            let llmApiResponse: any;
+
+            if (activeConfig.provider === "gemini") {
+              const geminiApiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${activeConfig.model}:generateContent?key=${actualApiKey}`;
+              const geminiPayload = {
+                contents: [{
+                  parts: [{ text: fullPrompt }]
+                }]
+                // TODO: Add system instruction if Gemini API supports it directly in this structure,
+                // or prepend it to the user's fullPrompt if necessary.
+                // For now, system instruction "You are a helpful assistant..." is omitted for direct Gemini.
               };
-            } else {
-              operationStatus = "failure";
-              errorMessage = "Define operation failed: No response from LLM or unexpected format.";
-              operationOutput = { message: errorMessage, details: response.data };
+              console.log(`Define with Gemini: URL=${geminiApiUrl}, Payload=${JSON.stringify(geminiPayload)}`);
+              llmApiResponse = await axios.post(geminiApiUrl, geminiPayload, {
+                headers: { "Content-Type": "application/json" },
+              });
+
+              if (llmApiResponse.data && llmApiResponse.data.candidates && llmApiResponse.data.candidates.length > 0 &&
+                  llmApiResponse.data.candidates[0].content && llmApiResponse.data.candidates[0].content.parts &&
+                  llmApiResponse.data.candidates[0].content.parts.length > 0) {
+                operationOutput = {
+                  definition_id: operationIdUUID,
+                  concept_defined: conceptName,
+                  generated_definition: llmApiResponse.data.candidates[0].content.parts[0].text,
+                  based_on_observations: params.operation.params.based_on_observation_ids || [],
+                  model_used: `gemini/${activeConfig.model}`, // Indicate Gemini was used
+                  api_response_id: "N/A for direct Gemini in this format" // Gemini API response structure is different
+                };
+              } else {
+                operationStatus = "failure";
+                errorMessage = "Define operation with Gemini failed: No response or unexpected format.";
+                operationOutput = { message: errorMessage, details: llmApiResponse.data };
+              }
+
+            } else { // Default to OpenRouter or other compatible providers
+              console.log(`Define with ${activeConfig.provider}: URL=${OPENROUTER_API_URL}, Model=${activeConfig.model}`);
+              llmApiResponse = await axios.post(
+                OPENROUTER_API_URL,
+                {
+                  model: activeConfig.model,
+                  messages: [
+                    { role: "system", content: "You are a helpful assistant that provides clear, concise definitions of concepts." },
+                    { role: "user", content: fullPrompt }
+                  ],
+                },
+                {
+                  headers: {
+                    "Authorization": `Bearer ${actualApiKey}`,
+                    "Content-Type": "application/json",
+                  },
+                }
+              );
+
+              if (llmApiResponse.data && llmApiResponse.data.choices && llmApiResponse.data.choices.length > 0) {
+                operationOutput = {
+                  definition_id: operationIdUUID,
+                  concept_defined: conceptName,
+                  generated_definition: llmApiResponse.data.choices[0].message.content,
+                  based_on_observations: params.operation.params.based_on_observation_ids || [],
+                  model_used: llmApiResponse.data.model, // Model from OpenRouter response
+                  api_response_id: llmApiResponse.data.id
+                };
+              } else {
+                operationStatus = "failure";
+                errorMessage = "Define operation failed: No response from LLM or unexpected format.";
+                operationOutput = { message: errorMessage, details: llmApiResponse.data };
+              }
             }
           } catch (apiError: any) {
             operationStatus = "failure";
@@ -1117,14 +1349,8 @@ server.tool(
           }
           break;
         case "infer":
-          if (!OPENROUTER_API_KEY) {
-            operationStatus = "failure";
-            errorMessage = "OpenRouter API key is not configured in .env file.";
-            operationOutput = { message: errorMessage };
-            console.error(errorMessage);
-            break;
-          }
           try {
+            const { activeConfig, actualApiKey } = await getLlmConfigAndKey();
             // Simplified premise handling: For now, just acknowledge them.
             // A full implementation would fetch and summarize content from these premise operations.
             let premiseContext = "";
@@ -1136,9 +1362,9 @@ server.tool(
             const fullPrompt = premiseContext + userPrompt;
 
             const response = await axios.post(
-              OPENROUTER_API_URL,
+              OPENROUTER_API_URL, // This might need to be dynamic if not using OpenRouter based on activeConfig.provider
               {
-                model: "deepseek/deepseek-r1-0528:free", // Specify the model
+                model: activeConfig.model, // Use model from active config
                 messages: [
                   { role: "system", content: "You are a helpful assistant performing a logical inference." },
                   { role: "user", content: fullPrompt }
@@ -1146,11 +1372,11 @@ server.tool(
               },
               {
                 headers: {
-                  "Authorization": `Bearer ${OPENROUTER_API_KEY}`,
+                  "Authorization": `Bearer ${actualApiKey}`, // Use actualApiKey from active config
                   "Content-Type": "application/json",
                   // Recommended by OpenRouter:
-                  // "HTTP-Referer": `${YOUR_SITE_URL}`,
-                  // "X-Title": `${YOUR_SITE_NAME}`,
+                  // "HTTP-Referer": `${YOUR_SITE_URL}`, // Consider making these dynamic or configurable if needed
+                  // "X-Title": `${YOUR_SITE_NAME}`,      // Consider making these dynamic or configurable if needed
                 },
               }
             );
@@ -1200,14 +1426,8 @@ server.tool(
                chosenOptionRetrievedOutput = `Output data for option ID ${chosenOptionUUID} not found.`;
             }
           }
-          if (!OPENROUTER_API_KEY) {
-            operationStatus = "failure";
-            errorMessage = "OpenRouter API key is not configured in .env file for decide operation.";
-            operationOutput = { message: errorMessage };
-            console.error(errorMessage);
-            break;
-          }
           try {
+            const { activeConfig, actualApiKey } = await getLlmConfigAndKey();
             // Ensure correct typing for decide operation parameters
             const decideSpecificParams = params.operation.params as z.infer<typeof decideParamsSchema>;
 
@@ -1267,9 +1487,9 @@ server.tool(
             const fullPrompt = `${optionsContext}\n${criteriaContext}\nDecision Prompt: ${decisionPrompt}\nDecision Method: ${decisionMethod}\n\nThe chosen option is ID: ${chosenOptionIdForJustification}. Please provide a detailed justification for why this option was chosen (or would be chosen) based on the provided criteria and decision method, explaining its strengths relative to other options (even if other options are not fully detailed here, infer their general nature if possible from the decision prompt).`;
 
             const llmResponse = await axios.post(
-              OPENROUTER_API_URL,
+              OPENROUTER_API_URL, // Assuming OpenRouter URL for now, or make dynamic based on activeConfig.provider
               {
-                model: "deepseek/deepseek-r1-0528:free",
+                model: activeConfig.model,
                 messages: [
                   { role: "system", content: "You are a helpful assistant that provides justifications for decisions based on options and criteria." },
                   { role: "user", content: fullPrompt }
@@ -1277,7 +1497,7 @@ server.tool(
               },
               {
                 headers: {
-                  "Authorization": `Bearer ${OPENROUTER_API_KEY}`,
+                  "Authorization": `Bearer ${actualApiKey}`,
                   "Content-Type": "application/json",
                 },
               }
@@ -1312,14 +1532,8 @@ server.tool(
           }
           break;
         case "synthesize":
-          if (!OPENROUTER_API_KEY) {
-            operationStatus = "failure";
-            errorMessage = "OpenRouter API key is not configured in .env file for synthesize operation.";
-            operationOutput = { message: errorMessage };
-            console.error(errorMessage);
-            break;
-          }
           try {
+            const { activeConfig, actualApiKey } = await getLlmConfigAndKey();
             let synthesisContext = "Synthesizing based on the following inputs:\n";
             if (params.operation.params.input_operation_ids && params.operation.params.input_operation_ids.length > 0) {
               for (const inputOpId of params.operation.params.input_operation_ids) {
@@ -1348,9 +1562,9 @@ server.tool(
             const fullPrompt = `${synthesisContext}\nSynthesis Goal: ${synthesisGoal}\nPlease provide the synthesized output. Adhere to the output format if specified: ${params.operation.params.output_format || 'natural language'}.`;
             
             const response = await axios.post(
-              OPENROUTER_API_URL,
+              OPENROUTER_API_URL, // Assuming OpenRouter URL for now, or make dynamic based on activeConfig.provider
               {
-                model: "deepseek/deepseek-r1-0528:free",
+                model: activeConfig.model,
                 messages: [
                   { role: "system", content: "You are a helpful assistant performing a synthesis task. Combine the provided inputs to achieve the stated goal." },
                   { role: "user", content: fullPrompt }
@@ -1358,7 +1572,7 @@ server.tool(
               },
               {
                 headers: {
-                  "Authorization": `Bearer ${OPENROUTER_API_KEY}`,
+                  "Authorization": `Bearer ${actualApiKey}`,
                   "Content-Type": "application/json",
                 },
               }
@@ -1400,14 +1614,8 @@ server.tool(
           operationOutput = { sequence_id: operationIdUUID, stored_item_count: params.operation.params.ordered_item_ids.length, name: params.operation.params.sequence_name || "unnamed_sequence" };
           break;
         case "compare":
-          if (!OPENROUTER_API_KEY) {
-            operationStatus = "failure";
-            errorMessage = "OpenRouter API key is not configured in .env file for compare operation.";
-            operationOutput = { message: errorMessage };
-            console.error(errorMessage);
-            break;
-          }
           try {
+            const { activeConfig, actualApiKey } = await getLlmConfigAndKey();
             const itemContents: { id: string, content: any, primitive_name?: string }[] = [];
             let allItemsFound = true;
 
@@ -1446,9 +1654,9 @@ server.tool(
             const fullPrompt = `${comparisonContext}Comparison Criteria: ${criteria}\nComparison Goal: ${goal}\n\nPlease provide the comparison result:`;
 
             const response = await axios.post(
-              OPENROUTER_API_URL,
+              OPENROUTER_API_URL, // Assuming OpenRouter URL for now, or make dynamic based on activeConfig.provider
               {
-                model: "deepseek/deepseek-r1-0528:free",
+                model: activeConfig.model,
                 messages: [
                   { role: "system", content: "You are a helpful assistant that compares items based on given criteria and a goal." },
                   { role: "user", content: fullPrompt }
@@ -1456,7 +1664,7 @@ server.tool(
               },
               {
                 headers: {
-                  "Authorization": `Bearer ${OPENROUTER_API_KEY}`,
+                  "Authorization": `Bearer ${actualApiKey}`,
                   "Content-Type": "application/json",
                 },
               }
@@ -1490,14 +1698,8 @@ server.tool(
           }
           break;
         case "reflect":
-          if (!OPENROUTER_API_KEY) {
-            operationStatus = "failure";
-            errorMessage = "OpenRouter API key is not configured in .env file for reflect operation.";
-            operationOutput = { message: errorMessage };
-            console.error(errorMessage);
-            break;
-          }
           try {
+            const { activeConfig, actualApiKey } = await getLlmConfigAndKey();
             let contextData = "";
             // Fetch output data for each target operation ID
             if (params.operation.params.target_operation_ids && params.operation.params.target_operation_ids.length > 0) {
@@ -1527,9 +1729,9 @@ server.tool(
             
             // Call OpenRouter API
             const response = await axios.post(
-              OPENROUTER_API_URL,
+              OPENROUTER_API_URL, // Assuming OpenRouter URL for now, or make dynamic based on activeConfig.provider
               {
-                model: "deepseek/deepseek-r1-0528:free",
+                model: activeConfig.model,
                 messages: [
                   { role: "system", content: "You are a helpful assistant that performs reflection and meta-cognition." },
                   { role: "user", content: fullPrompt }
@@ -1537,7 +1739,7 @@ server.tool(
               },
               {
                 headers: {
-                  "Authorization": `Bearer ${OPENROUTER_API_KEY}`,
+                  "Authorization": `Bearer ${actualApiKey}`,
                   "Content-Type": "application/json",
                 },
               }
@@ -1569,14 +1771,8 @@ server.tool(
           }
           break;
         case "ask":
-          if (!OPENROUTER_API_KEY) {
-            operationStatus = "failure";
-            errorMessage = "OpenRouter API key is not configured in .env file for ask operation.";
-            operationOutput = { message: errorMessage };
-            console.error(errorMessage);
-            break;
-          }
           try {
+            const { activeConfig, actualApiKey } = await getLlmConfigAndKey();
             // Extract parameters
             const informationNeed = params.operation.params.information_need;
             const targetSource = params.operation.params.target_source || "any available source";
@@ -1592,9 +1788,9 @@ Please generate a well-formulated query, a series of questions, or a detailed pl
 
             // Call OpenRouter API
             const response = await axios.post(
-              OPENROUTER_API_URL,
+              OPENROUTER_API_URL, // Assuming OpenRouter URL for now, or make dynamic based on activeConfig.provider
               {
-                model: "deepseek/deepseek-r1-0528:free",
+                model: activeConfig.model,
                 messages: [
                   { role: "system", content: "You are a helpful assistant that formulates information requests." },
                   { role: "user", content: fullPrompt }
@@ -1602,7 +1798,7 @@ Please generate a well-formulated query, a series of questions, or a detailed pl
               },
               {
                 headers: {
-                  "Authorization": `Bearer ${OPENROUTER_API_KEY}`,
+                  "Authorization": `Bearer ${actualApiKey}`,
                   "Content-Type": "application/json",
                 },
               }
@@ -1639,14 +1835,8 @@ Please generate a well-formulated query, a series of questions, or a detailed pl
           if (params.operation.type !== "adapt") break;
           const opParams = params.operation.params;
           
-          if (!OPENROUTER_API_KEY) {
-            operationStatus = "failure";
-            errorMessage = "OpenRouter API key is not configured in .env file for adapt operation.";
-            operationOutput = { message: errorMessage };
-            console.error(errorMessage);
-            break;
-          }
           try {
+            const { activeConfig, actualApiKey } = await getLlmConfigAndKey();
             // Fetch target operation output
             const targetRow = await new Promise<any>((resolve, reject) => {
               db.get("SELECT output_data, primitive_name FROM operations WHERE operation_id = ?", [opParams.target_operation_id], (err, row) => {
@@ -1697,9 +1887,9 @@ Please generate a well-formulated query, a series of questions, or a detailed pl
             
             // Call OpenRouter API
             const response = await axios.post(
-              OPENROUTER_API_URL,
+              OPENROUTER_API_URL, // Assuming OpenRouter URL for now, or make dynamic based on activeConfig.provider
               {
-                model: "deepseek/deepseek-r1-0528:free",
+                model: activeConfig.model,
                 messages: [
                   { role: "system", content: "You are a helpful assistant that adapts content based on instructions and feedback." },
                   { role: "user", content: fullPrompt }
@@ -1707,7 +1897,7 @@ Please generate a well-formulated query, a series of questions, or a detailed pl
               },
               {
                 headers: {
-                  "Authorization": `Bearer ${OPENROUTER_API_KEY}`,
+                  "Authorization": `Bearer ${actualApiKey}`,
                   "Content-Type": "application/json",
                 },
               }
@@ -1906,6 +2096,7 @@ Please generate a well-formulated query, a series of questions, or a detailed pl
 );
 
 async function main() {
+console.log("<<<<< SERVER MAIN FUNCTION STARTED - VERSION WITH EXTENSIVE LOGGING >>>>>"); // New prominent log
   try {
     await initializeDatabase();
 
