@@ -104,3 +104,24 @@ Contributions are welcome! Please feel free to submit pull requests or open issu
 ---
 
 *This README provides a basic overview. Further details on specific primitives, API usage, and advanced configurations will be added as the project evolves.*
+
+## Example Configuration
+
+Below is an example runtime configuration for the logic-mcp server as it would appear in an MCP settings file:
+
+```json
+"logic-mcp": {
+  "name": "logic-mcp",
+  "command": "node",
+  "args": [
+    "build/index.js"
+  ],
+  "cwd": "/path/to/logic-mcp",
+  "enabled": true,
+  "alwaysAllow": [
+    "execute_logic_operation",
+    "mcp.discovery"
+  ],
+  "disabled": false
+}
+```
