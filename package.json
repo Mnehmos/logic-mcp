@@ -3,7 +3,6 @@
   "version": "0.1.0",
   "description": "Logic MCP Server - Rebuilt",
   "main": "build/index.js",
-  "type": "module",
   "scripts": {
     "build": "tsc && node -e \"require('fs').chmodSync('build/index.js', '755')\"",
     "start": "node build/index.js",

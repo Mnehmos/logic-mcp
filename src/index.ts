@@ -81,6 +81,12 @@ CREATE TABLE IF NOT EXISTS logic_chains (
     FOREIGN KEY (root_operation) REFERENCES operations(id)
 );
 
+-- Check and add chain_name column if it doesn't exist
+PRAGMA table_info(logic_chains);
+-- This PRAGMA statement is executed as part of the schema string,
+-- but its results are not directly accessible here.
+-- The logic to check and alter will be added in the TypeScript code.
+
 -- Indexes for performance optimization
 CREATE INDEX IF NOT EXISTS idx_operations_primitive ON operations(primitive_name);
 CREATE INDEX IF NOT EXISTS idx_operations_status ON operations(status);
@@ -108,7 +114,52 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_active_llm_config ON llm_configurations (i
           return reject(execErr);
         }
         console.log('Database schema applied successfully.');
-        resolve();
+
+        // Check and add chain_name column to logic_chains table
+        db.all(`PRAGMA table_info(logic_chains);`, (err, columns: any[]) => {
+          if (err) {
+            console.error('Error checking logic_chains schema:', err.message);
+            return reject(err);
+          }
+          const hasChainName = columns.some(col => col.name === 'chain_name');
+          if (!hasChainName) {
+            db.exec(`ALTER TABLE logic_chains ADD COLUMN chain_name TEXT;`, (alterErr) => {
+              if (alterErr) {
+                console.error('Error adding chain_name column to logic_chains:', alterErr.message);
+                return reject(alterErr);
+              }
+              console.log("Added chain_name column to logic_chains table.");
+              // Proceed to check operations table after this alter is done
+              checkAndAddOperationNameColumn();
+            });
+          } else {
+            // If chain_name already exists, proceed to check operations table
+            checkAndAddOperationNameColumn();
+          }
+        });
+
+        function checkAndAddOperationNameColumn() {
+          // Check and add operation_name column to operations table
+          db.all(`PRAGMA table_info(operations);`, (err, columns: any[]) => {
+            if (err) {
+              console.error('Error checking operations schema:', err.message);
+              return reject(err);
+            }
+            const hasOperationName = columns.some(col => col.name === 'operation_name');
+            if (!hasOperationName) {
+              db.exec(`ALTER TABLE operations ADD COLUMN operation_name TEXT;`, (alterErr) => {
+                if (alterErr) {
+                  console.error('Error adding operation_name column to operations:', alterErr.message);
+                  return reject(alterErr);
+                }
+                console.log("Added operation_name column to operations table.");
+                resolve(); // All checks and alters are done
+              });
+            } else {
+              resolve(); // All checks and alters are done
+            }
+          });
+        }
       });
     });
   });
@@ -929,6 +980,7 @@ server.tool(
     let errorMessage: string | undefined;
     let currentChainId = params.chain_id;
     let isNewChain = false;
+    let finalChainName: string | null = null; // Declare here
 
     try {
       // 1. Ensure chain exists or create it
@@ -956,10 +1008,11 @@ server.tool(
             }
           );
         });
+        finalChainName = chainName; // Assign the newly generated/provided chainName
       } else {
-        // Verify chain exists
-        const chainRow = await new Promise((resolve, reject) => {
-          db.get("SELECT chain_id FROM logic_chains WHERE chain_id = ?", [currentChainId], (err, row) => {
+        // Verify chain exists and fetch its name
+        const chainRow = await new Promise<any>((resolve, reject) => {
+          db.get("SELECT chain_id, chain_name FROM logic_chains WHERE chain_id = ?", [currentChainId], (err, row) => {
             if (err) {
               console.error("Error verifying chain:", err);
               return reject(err);
@@ -973,6 +1026,7 @@ server.tool(
             isError: true,
           };
         }
+        finalChainName = chainRow.chain_name; // Assign the fetched chain name
       }
 
       // 2. Basic dispatch logic (stubbed implementations)
@@ -1836,7 +1890,9 @@ Please generate a well-formulated query, a series of questions, or a detailed pl
           type: "text", // Changed from "json" to "text"
           text: JSON.stringify({ // Stringify the JSON payload
             chain_id: currentChainId,
+            chain_name: finalChainName, // Include chain_name
             operation_id: operationIdUUID,
+            operation_name: operationName, // Include operation_name
             operation_type: params.operation.type,
             status: operationStatus,
             output: operationOutput,
