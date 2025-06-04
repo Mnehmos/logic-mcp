@@ -12,7 +12,7 @@ This server is intended to be used in conjunction with the [Logic MCP Webapp](ht
 
 Watch a demonstration of the Logic MCP server attempting to solve the "Passport Pandemonium" logic puzzle:
 
-[![Logic MCP Solves Passport Pandemonium](https://img.youtube.com/vi/lFt_XrPvSIA/0.jpg)](https://www.youtube.com/watch?v=lFt_XrPvSIA)
+[![Logic MCP Solves Passport Pandemonium](https://img.youtube.com/vi/lFt_XrPvSIA/0.jpg)](https://www.youtube.com/watch?v=lFt_XrPvSIA) 
 
 ## Features
 
