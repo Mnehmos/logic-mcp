@@ -7,6 +7,12 @@ The `logic-mcp` server is a backend application designed to execute advanced log
 It features dynamic LLM configuration, allowing users to switch between different language models and providers (like OpenRouter, Google Gemini, etc.) via API calls or a companion web application. All operations and their relationships are traced and stored in a SQLite database, enabling history reconstruction and logic chain visualization.
 
 This server is intended to be used in conjunction with the [Logic MCP Webapp](https://github.com/Mnehmos/logic-mcp-webapp) for easier management and interaction.
+![image](https://github.com/user-attachments/assets/99dfbf19-367b-46d1-b94f-dae44103fdd9)
+![image](https://github.com/user-attachments/assets/076be2f6-742e-4357-b554-9ce154e129bb)
+![image](https://github.com/user-attachments/assets/de9e8546-2425-4fac-a186-a7df8469dcdb)
+![image](https://github.com/user-attachments/assets/a7b25899-da67-4c2c-be22-7ef43a7b1260)
+![image](https://github.com/user-attachments/assets/6013f812-7a28-4d7a-8b4b-d554b0d15c27)
+
 
 ## Demonstration: Logic Puzzle Solving
 
